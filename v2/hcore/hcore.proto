@@ -168,6 +168,9 @@ message OutboundGroup {
   bool Is_expand=5;
   repeated OutboundInfo items = 6;
   bool keep_top_picking = 7; // keep top still goes through the proxies: which of them stay in use is not settled
+  // the tiered group only (tag "tiered"): the state of the choice by the server's policy, as JSON
+  // {"tier","mode","node","reason","checking","confirm","down","network","since"} (v2/tiered State)
+  string tier_state = 8;
 }
 message OutboundGroupList{
   repeated OutboundGroup items = 1;

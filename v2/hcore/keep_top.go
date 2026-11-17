@@ -33,6 +33,8 @@ func buildRunningConfig(ctx context.Context, in *StartRequest) (*option.Options,
 	if err == nil {
 		recordDelegatedSystemProxy(options)
 		markEngineLeftovers(options)
+		// the tiered controller of this config starts with the connectivity watcher
+		noteTierPlan(static.HiddifyOptions, options)
 	}
 	return options, err
 }

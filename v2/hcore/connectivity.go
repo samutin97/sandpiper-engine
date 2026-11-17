@@ -46,11 +46,14 @@ func startConnectivityWatcher() {
 		defer close(done)
 		static.watchConnectivity(ctx)
 	}()
+	// the choice by the server's ranking runs as long as this config does (tiered_runtime.go)
+	startTieredRuntime()
 }
 
 // stopConnectivityWatcher ends the watcher and waits for it, so it cannot change the state of a
 // core that is stopping; static.lock must be held.
 func stopConnectivityWatcher() {
+	stopTieredRuntime()
 	if watcher.cancel == nil {
 		return
 	}
@@ -129,6 +132,11 @@ func (h *HiddifyInstance) proxiesConnectivity() CoreStates {
 	}
 	monitor := monitoring.Get(ctx)
 	histories := monitor.OutboundsHistory("")
+	// with the tiered group picked, the proxy it chose answering is a working connection: under a
+	// TCP freeze it is a UDP proxy, while lowest has only TCP ones
+	if tieredConnectivity(histories) {
+		return CoreStates_STARTED
+	}
 	lowest, ok := box.Outbound().Outbound(config.OutboundURLTestTag)
 	if !ok {
 		return decideConnectivity(0, true, selectProxyLeaves(box, histories, monitor.Parked))

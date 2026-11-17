@@ -324,6 +324,9 @@ func (h *HiddifyInstance) GetAllProxiesInfo(hismap map[string]*adapter.URLTestHi
 			}
 		}
 		group.Selected = selectedTag
+		if group.Tag == config.OutboundTieredTag {
+			group.TierState = tierState()
+		}
 
 		// outbounds_converted[iGroup.Tag()].GroupSelectedOutbound = &group.Selected
 		if cacheFile != nil {
@@ -458,6 +461,8 @@ func (h *HiddifyInstance) AllProxiesInfoStream(stream grpc.ServerStreamingServer
 	defer monitor.UnsubscribeGroup("", urltestch)
 	speedch, unsubscribeSpeedTests := subscribeSpeedTests()
 	defer unsubscribeSpeedTests()
+	tierch, unsubscribeTiers := subscribeTierState()
+	defer unsubscribeTiers()
 
 	// Debounce URL-test / traffic bursts; selection events (GroupEvent.Priority) flush at once.
 	const debounceWindow = 1000 * time.Millisecond
@@ -488,6 +493,13 @@ func (h *HiddifyInstance) AllProxiesInfoStream(stream grpc.ServerStreamingServer
 			return nil
 		case <-keepActive.C:
 			monitor.Touch()
+		case <-tierch:
+			// the choice by the server's ranking changed its state: shown at once
+			stopTimer()
+			if err := send(); err != nil {
+				Log(LogLevel_ERROR, LogType_CORE, "failed to send outbounds info: ", err)
+				return err
+			}
 		case <-speedch:
 			// a speed test began or ended: shown with the next send
 			if timer == nil {

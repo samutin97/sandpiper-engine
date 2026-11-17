@@ -221,6 +221,15 @@ func (h *HiddifyInstance) SelectOutbound(in *SelectOutboundRequest) (*hcommon.Re
 	// 	Message: "",
 	// }, nil
 	Log(LogLevel_DEBUG, LogType_CORE, "select outbound: ", in.GroupTag, " -> ", in.OutboundTag)
+	// in the tiered group the core selects; the app's call there is the user's agreement to the
+	// last-resort proxy the controller waits on, nothing else
+	if in.GroupTag == config.OutboundTieredTag {
+		if !tierConfirm(in.OutboundTag) {
+			err := E.New("the tiered group waits for no agreement to ", in.OutboundTag)
+			return &hcommon.Response{Code: hcommon.ResponseCode_FAILED, Message: err.Error()}, err
+		}
+		return &hcommon.Response{Code: hcommon.ResponseCode_OK}, nil
+	}
 	if box := h.Box(); box != nil {
 		outboundGroup, isLoaded := box.Outbound().Outbound(in.GroupTag)
 		if !isLoaded {
