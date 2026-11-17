@@ -2,6 +2,7 @@ package config
 
 import (
 	"net"
+	"slices"
 	"strings"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -19,6 +20,11 @@ import (
 
 // OutboundTieredTag is the selector the controller selects in.
 const OutboundTieredTag = "tiered"
+
+// OutboundTieredWaitTag is the tiered group's member that carries nothing (a block outbound, its
+// connections refused, hidden from the lists): the group waits there while only a last resort the
+// user has not agreed to is left. The group never starts on such a last resort, nor stays on one.
+const OutboundTieredWaitTag = "tiered-wait §hide§"
 
 // TierPolicyOptions is the profile's policy as the app sends it.
 type TierPolicyOptions struct {
@@ -99,9 +105,12 @@ func isHexDigit(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
-// tierGroup is the tiered selector of the proxies tags (their order in the profile) by the
-// policy, nil when it binds no proxy. udp says which proxies carry their traffic over UDP.
-func tierGroup(hopt *HiddifyOptions, tags []string, udp map[string]bool) *option.Outbound {
+// tierPlanOf is the policy bound to the profile's proxies tags (their order in the profile), nil
+// without a policy or when it binds no proxy. udp says which proxies carry their traffic over UDP.
+// The group and the core's controller take the plan from here, bound once to the same tags: a
+// reference that names one proxy among the group's members but several among the profile's (two
+// names starting with the same number) must not bind in one and not in the other.
+func tierPlanOf(hopt *HiddifyOptions, tags []string, udp map[string]bool) *tiered.Plan {
 	policy := TierPolicyOf(hopt)
 	if policy == nil {
 		return nil
@@ -110,31 +119,57 @@ func tierGroup(hopt *HiddifyOptions, tags []string, udp map[string]bool) *option
 	if len(plan.Candidates) == 0 {
 		return nil
 	}
-	return &option.Outbound{
+	return plan
+}
+
+// tierGroup is the tiered selector of plan, and its wait member. It starts on the first proxy that
+// needs no agreement of the user, on the wait when there is none; a choice kept from an earlier run
+// is checked against the same rule by the core before anything goes through the group.
+func tierGroup(plan *tiered.Plan) (group, wait option.Outbound) {
+	start := OutboundTieredWaitTag
+	reserves := plan.Reserves()
+	for _, cand := range plan.Candidates {
+		if !slices.Contains(reserves, cand.Tag) {
+			start = cand.Tag
+			break
+		}
+	}
+	group = option.Outbound{
 		Type: C.TypeSelector,
 		Tag:  OutboundTieredTag,
 		Options: &option.SelectorOutboundOptions{
-			Outbounds: plan.Tags(),
-			Default:   plan.Candidates[0].Tag,
+			Outbounds: append(plan.Tags(), OutboundTieredWaitTag),
+			Default:   start,
 			// a proxy left because it froze leaves frozen connections: they are cut, so the apps
 			// open them again at once; a way back up is rare (two passes, hours apart at most)
 			InterruptExistConnections: true,
 		},
 	}
+	wait = option.Outbound{Type: C.TypeBlock, Tag: OutboundTieredWaitTag, Options: &option.StubOptions{}}
+	return group, wait
 }
 
-// TierPlan is the policy bound to the members of the built config's tiered group, nil without one.
+// TierPlan is the plan of the built config's tiered group, nil without one: the policy bound to the
+// profile's proxies (select's members but the groups), as the builder bound it, and nil when that is
+// not the group's members (it always is; a plan that did not match the group would let the core
+// judge proxies by another policy than the one the app shows).
 func TierPlan(options *option.Options, hopt *HiddifyOptions) *tiered.Plan {
-	policy := TierPolicyOf(hopt)
-	if policy == nil || options == nil {
+	if options == nil {
 		return nil
 	}
-	var members []string
+	var members, profile []string
 	udp := map[string]bool{}
 	for _, out := range options.Outbounds {
-		if out.Tag == OutboundTieredTag {
-			if sel, ok := out.Options.(*option.SelectorOutboundOptions); ok {
+		if sel, ok := out.Options.(*option.SelectorOutboundOptions); ok {
+			switch out.Tag {
+			case OutboundTieredTag:
 				members = sel.Outbounds
+			case OutboundSelectTag:
+				for _, tag := range sel.Outbounds {
+					if tag != OutboundTieredTag && tag != OutboundURLTestTag && tag != OutboundRoundRobinTag {
+						profile = append(profile, tag)
+					}
+				}
 			}
 		}
 		if udpProxy(out.Type, out.Options) {
@@ -149,9 +184,23 @@ func TierPlan(options *option.Options, hopt *HiddifyOptions) *tiered.Plan {
 	if len(members) == 0 {
 		return nil
 	}
-	plan := policy.Bind(members, func(tag string) bool { return udp[tag] })
-	if len(plan.Candidates) == 0 {
+	plan := tierPlanOf(hopt, profile, udp)
+	if plan == nil || !slices.Equal(append(plan.Tags(), OutboundTieredWaitTag), members) {
 		return nil
 	}
 	return plan
+}
+
+// withoutTags is tags without the ones in drop, in their order.
+func withoutTags(tags, drop []string) []string {
+	if len(drop) == 0 {
+		return tags
+	}
+	var kept []string
+	for _, tag := range tags {
+		if !slices.Contains(drop, tag) {
+			kept = append(kept, tag)
+		}
+	}
+	return kept
 }

@@ -19,6 +19,8 @@ import (
 	sdns "github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
+
+	"github.com/hiddify/hiddify-core/v2/tiered"
 )
 
 // A balancer's member takes the selection when faster by more than the larger of the two: a
@@ -71,7 +73,7 @@ const (
 var (
 	OutboundMainDetour       = OutboundSelectTag
 	OutboundWARPConfigDetour = OutboundDirectFragmentTag
-	PredefinedOutboundTags   = []string{OutboundDirectTag, OutboundBypassTag, OutboundSelectTag, OutboundURLTestTag, OutboundDirectFragmentTag, ChainExtraSecurityTag, ChainUnblockerTag, OutboundTieredTag}
+	PredefinedOutboundTags   = []string{OutboundDirectTag, OutboundBypassTag, OutboundSelectTag, OutboundURLTestTag, OutboundDirectFragmentTag, ChainExtraSecurityTag, ChainUnblockerTag, OutboundTieredTag, OutboundTieredWaitTag}
 )
 
 // TODO include selectors
@@ -310,7 +312,19 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 	// 		InterruptExistConnections: true,
 	// 	},
 	// }
-	autoTags := autoGroupTags(tags, profileAuto, manualOnly)
+	// the subscription server's ranking (with two proxies or more, as the other groups)
+	var tierPlan *tiered.Plan
+	if len(tags) > 1 {
+		tierPlan = tierPlanOf(opt, tags, udpTags)
+	}
+	// a last resort that waits for the user's agreement is in no automatic group, whatever the
+	// settings (a TCP one, or UDP endpoints in the automatic groups): lowest and balance would use
+	// and test it without that agreement. It is tested only when selected or asked for.
+	autoTags := withoutTags(autoGroupTags(tags, profileAuto, manualOnly), tierPlan.Reserves())
+	if len(autoTags) == 0 {
+		// only such last resorts: the automatic groups carry nothing (a group needs a member)
+		autoTags = []string{OutboundTieredWaitTag}
+	}
 	// the tunnels outside the automatic groups talk to their servers only while used
 	lazyQuietTunnels(endpoints, autoTags)
 	if options.Experimental != nil && options.Experimental.Monitoring != nil {
@@ -384,11 +398,12 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 			defaultSelect = balancer.Tag
 		}
 		// the subscription server's ranking: its group first, and what select starts on
-		if tiered := tierGroup(opt, tags, udpTags); tiered != nil {
-			outbounds = append([]option.Outbound{*tiered}, outbounds...)
-			selectorTags = append([]string{tiered.Tag}, selectorTags...)
-			defaultSelect = tiered.Tag
-			fmt.Printf("tiered group: %d of %d proxies, by the server's policy\n", len(tiered.Options.(*option.SelectorOutboundOptions).Outbounds), len(tags))
+		if tierPlan != nil {
+			tieredGroup, wait := tierGroup(tierPlan)
+			outbounds = append([]option.Outbound{tieredGroup}, append(outbounds, wait)...)
+			selectorTags = append([]string{tieredGroup.Tag}, selectorTags...)
+			defaultSelect = tieredGroup.Tag
+			fmt.Printf("tiered group: %d of %d proxies, by the server's policy\n", len(tierPlan.Candidates), len(tags))
 		}
 	}
 	selector := option.Outbound{
