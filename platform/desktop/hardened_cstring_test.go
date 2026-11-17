@@ -44,6 +44,15 @@ func TestErrorTextOutlivesTheCall(t *testing.T) {
 	freeString(nil)
 }
 
+// W4-01: the app learns the port its core took from getListenAddress; nothing listens before setup.
+func TestListenAddressBeforeSetup(t *testing.T) {
+	address := getListenAddress(1)
+	defer freeString(address)
+	if got := readString(unsafe.Pointer(address)); got != "" {
+		t.Fatalf("an address before setup: %q", got)
+	}
+}
+
 // W4-02: no export frees the string it returns; the caller does, with freeString.
 func TestNoExportFreesWhatItReturns(t *testing.T) {
 	files := token.NewFileSet()

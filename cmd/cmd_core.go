@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,11 +18,17 @@ import (
 )
 
 // The desktop app runs its core in a process of its own with this command, instead of loading the
-// library into the UI process. The app reads one line from stdout: CoreReadyPrefix followed by the
-// gRPC server certificate (base64 PEM, empty without TLS), or CoreErrorPrefix followed by the reason.
+// library into the UI process. The app reads stdout until CoreReadyPrefix followed by the gRPC
+// server certificate (base64 PEM, empty without TLS), or CoreErrorPrefix followed by the reason.
+// Before the ready line, CoreListenPrefix gives the address the server really listens on: the app
+// asks for port 0, a free port, so that no fixed port is shared with another app (upstream Hiddify
+// listens on 17078 and 17079) and none is known to a scan of the loopback.
 const (
-	CoreReadyPrefix = "HIDDIFY_CORE_READY "
-	CoreErrorPrefix = "HIDDIFY_CORE_ERROR "
+	CoreReadyPrefix  = "HIDDIFY_CORE_READY "
+	CoreErrorPrefix  = "HIDDIFY_CORE_ERROR "
+	CoreListenPrefix = "HIDDIFY_CORE_LISTEN "
+	// defaultCoreListen is a free loopback port; the actual address is printed (CoreListenPrefix).
+	defaultCoreListen = "127.0.0.1:0"
 	// CoreSecretEnv carries the setup secret, so it never shows in the process list.
 	CoreSecretEnv = "HIDDIFY_CORE_SECRET"
 	// coreStopTimeout bounds the graceful stop: the system proxy is restored by it.
@@ -56,7 +63,7 @@ func init() {
 	flags.StringVar(&coreOptions.baseDir, "base-dir", "", "base directory")
 	flags.StringVar(&coreOptions.workingDir, "working-dir", "", "working directory")
 	flags.StringVar(&coreOptions.tempDir, "temp-dir", "", "temporary directory")
-	flags.StringVar(&coreOptions.listen, "listen", "127.0.0.1:17078", "gRPC listen address")
+	flags.StringVar(&coreOptions.listen, "listen", defaultCoreListen, "gRPC listen address (port 0: a free port, printed after "+strings.TrimSpace(CoreListenPrefix)+")")
 	flags.Int32Var(&coreOptions.mode, "mode", int32(hcore.SetupMode_GRPC_NORMAL), "setup mode")
 	flags.Int32Var(&coreOptions.ownerPID, "owner-pid", 0, "the app's process: the core stops when it is gone")
 	flags.BoolVar(&coreOptions.debug, "debug", false, "debug mode")
@@ -83,6 +90,7 @@ func runCore() int {
 	}
 	// threads the setup started are named as well
 	hprocess.SetName(coreProcessName, cliArgs)
+	writeCoreLine(CoreListenPrefix + hcore.GetListenAddress(mode))
 	writeCoreLine(CoreReadyPrefix + base64.StdEncoding.EncodeToString(hcore.GetGrpcServerPublicKey()))
 	// Nothing else goes to the app's pipes: once the app is gone a write to them would end the core
 	// before it stops cleanly. Its log reaches the app over gRPC.

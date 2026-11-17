@@ -172,3 +172,13 @@ func closeGrpc(mode C.int) {
 	hcore.Close(hcore.SetupMode(mode))
 }
 
+// getListenAddress is the address the control server of mode listens on ("127.0.0.1:41234"), or
+// "" when it does not run: the app sets the core up on port 0, a free port, and connects to the
+// one this tells, as the Android app does through gomobile's Mobile.getListenAddress. Upstream's
+// fixed 17078 was taken whenever upstream Hiddify ran on the same computer (W4-01). The caller
+// frees the string with freeString.
+//
+//export getListenAddress
+func getListenAddress(mode C.int) *C.char {
+	return C.CString(hcore.GetListenAddress(hcore.SetupMode(mode)))
+}
