@@ -74,6 +74,60 @@ func TestTierTransferCheckSeesAFreeze(t *testing.T) {
 	}
 }
 
+// a tunnel's connection that keeps no deadline: the watchdog still ends a frozen transfer
+type noDeadlineConn struct{ net.Conn }
+
+func (noDeadlineConn) SetDeadline(time.Time) error      { return nil }
+func (noDeadlineConn) SetReadDeadline(time.Time) error  { return nil }
+func (noDeadlineConn) SetWriteDeadline(time.Time) error { return nil }
+
+type noDeadlineDialer struct{ loopDialer }
+
+func (d noDeadlineDialer) DialContext(ctx context.Context, network string, dest M.Socksaddr) (net.Conn, error) {
+	conn, err := d.loopDialer.DialContext(ctx, network, dest)
+	if err != nil {
+		return nil, err
+	}
+	return noDeadlineConn{conn}, nil
+}
+
+func freezingHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Length", "65536")
+	w.WriteHeader(http.StatusPartialContent)
+	w.Write(make([]byte, 18<<10))
+	w.(http.Flusher).Flush()
+	select {
+	case <-r.Context().Done():
+	case <-time.After(15 * time.Second):
+	}
+}
+
+func TestTierTransferCheckFreezeWithoutDeadlines(t *testing.T) {
+	dialer := tierTestServer(t, freezingHandler)
+	start := time.Now()
+	r := transferCheck(context.Background(), noDeadlineDialer{dialer}, "example.com", "/files/sample.bin")
+	if r.Outcome != tiered.Stall || time.Since(start) > tierCheckAnswer+tierCheckStall {
+		t.Fatalf("outcome %s after %s", r.Outcome, time.Since(start))
+	}
+}
+
+func TestTierTransferCheckSlowButFlowing(t *testing.T) {
+	dialer := tierTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "65536")
+		w.WriteHeader(http.StatusPartialContent)
+		for sent := 0; sent < 65536; sent += 2048 {
+			if _, err := w.Write(make([]byte, 2048)); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+			time.Sleep(250 * time.Millisecond) // 8 KB/s
+		}
+	})
+	if r := transferCheck(context.Background(), dialer, "example.com", "/files/sample.bin"); r.Outcome != tiered.Slow {
+		t.Fatalf("outcome %s", r.Outcome)
+	}
+}
+
 func TestTierTransferCheckWithoutAnAnswer(t *testing.T) {
 	// nothing listens
 	listener, _ := net.Listen("tcp", "127.0.0.1:0")

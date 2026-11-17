@@ -414,7 +414,9 @@ func urlTestCheck(ctx context.Context, dialer N.Dialer, link string) tiered.Chec
 var tierRootCAs *x509.CertPool
 
 // transferCheck downloads the first 64 KiB of path from host through dialer, over TLS inside the
-// tunnel; see the limits above.
+// tunnel; see the limits above. A watchdog closes the connection when nothing came for its time (a
+// tunnel's connection may not keep a deadline): the answer within tierCheckAnswer, then a byte of
+// the body at least every tierCheckStall, all within tierCheckTotal.
 func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) tiered.CheckResult {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, tierCheckTotal)
@@ -426,10 +428,15 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) tier
 		return tiered.CheckResult{Outcome: tiered.NoConnect}
 	}
 	defer conn.Close()
-	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
+	var stalled atomic.Bool
+	watchdog := time.AfterFunc(max(time.Until(start.Add(tierCheckAnswer)), 0), func() {
+		stalled.Store(true)
+		conn.Close()
+	})
+	defer watchdog.Stop()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
-	answerBy := start.Add(tierCheckAnswer)
-	conn.SetDeadline(answerBy)
+	conn.SetDeadline(start.Add(tierCheckAnswer))
 	tlsConn := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, RootCAs: tierRootCAs})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return tiered.CheckResult{Outcome: tiered.NoConnect}
@@ -445,6 +452,8 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) tier
 		return tiered.CheckResult{Outcome: tiered.NoConnect}
 	}
 	latency := time.Since(start)
+	watchdog.Reset(tierCheckStall)
+	conn.SetDeadline(time.Time{})
 	length := int64(-1)
 	for {
 		line, err := reader.ReadString('\n')
@@ -472,23 +481,34 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) tier
 		conn.SetReadDeadline(minTime(time.Now().Add(tierCheckStall), start.Add(tierCheckTotal)))
 		n, err := reader.Read(buffer)
 		got += int64(n)
+		if n > 0 {
+			watchdog.Reset(tierCheckStall)
+		}
 		if err != nil {
 			if errors.Is(err, io.EOF) && length < 0 {
 				break // the whole body, of a length not given
 			}
+			if ctx.Err() != nil && !stalled.Load() && got >= freezeWindowEnd {
+				// still coming when the time was up, past where a freeze stops a transfer: slow
+				return tiered.CheckResult{Outcome: tiered.Slow, Latency: latency}
+			}
 			var netErr net.Error
-			if got > 0 || errors.As(err, &netErr) && netErr.Timeout() {
+			if got > 0 || stalled.Load() || errors.As(err, &netErr) && netErr.Timeout() {
 				return tiered.CheckResult{Outcome: tiered.Stall, Latency: latency}
 			}
 			return tiered.CheckResult{Outcome: tiered.NoConnect, Latency: latency}
 		}
 	}
 	result := tiered.CheckResult{Outcome: tiered.OK, Latency: latency}
-	if took := time.Since(bodyStart); got >= 32<<10 && took > 0 && float64(got)/took.Seconds() < tierSlowBelow {
+	if took := time.Since(bodyStart); got >= freezeWindowEnd && took > 0 && float64(got)/took.Seconds() < tierSlowBelow {
 		result.Outcome = tiered.Slow
 	}
 	return result
 }
+
+// freezeWindowEnd: a transfer that got this far went past where the "16 KB" freeze stops one
+// (14 to 25 KB).
+const freezeWindowEnd = 32 << 10
 
 func minTime(a, b time.Time) time.Time {
 	if a.Before(b) {
