@@ -16,7 +16,8 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-const adminBgServicePort uint16 = 18020
+// the fork's own port, never upstream Hiddify's 18020 (see hcore's adminBgServicePort)
+const adminBgServicePort uint16 = 18420
 
 var (
 	adminBgServiceAddress = fmt.Sprintf("127.0.0.1:%d", adminBgServicePort)
@@ -158,7 +159,7 @@ func getTunnelServicePath() string {
 	binFolder := filepath.Dir(exePath)
 	switch runtime.GOOS {
 	case "windows":
-		fullPath = "HiddifyCore.exe"
+		fullPath = "SandpiperCore.exe" // the core's Makefile, WIN_CLINAME
 	case "darwin":
 		fallthrough
 	default:

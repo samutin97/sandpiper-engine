@@ -8,13 +8,13 @@
         },
         "info": {
           "0409": {
-            "CompanyName": "Hiddify",
-            "FileDescription": "Hiddify Core",
+            "CompanyName": "Sandpiper",
+            "FileDescription": "Sandpiper Core",
             "InternalName": "hiddify-core",
-            "LegalCopyright": "Copyright (C) Hiddify.com. All rights reserved.",
+            "LegalCopyright": "Sandpiper contributors, GPL-3.0",
             "OriginalFilename": "hiddify-core.dll",
-            "ProductName": "Hiddify",
-            "Comments": "https://github.com/hiddify/hiddify-core"
+            "ProductName": "Sandpiper",
+            "Comments": "A modified build of hiddify-core"
           }
         }
       }

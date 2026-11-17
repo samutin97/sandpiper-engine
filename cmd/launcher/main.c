@@ -1,14 +1,15 @@
 // The launchers of hiddify-core: each forwards its command line to parseCli() in the core library.
 // One source, built four ways:
 //
-//   Windows (windows-amd64 in the Makefile)
-//   HiddifyCore.exe       console tool, prints parseCli's result
-//   HiddifyAdmin.exe      -DHIDDIFY_LAUNCHER_GUI: GUI subsystem, with a requireAdministrator
-//                         manifest, so the UAC dialog shows "Hiddify" and the app icon and no
-//                         console window flashes; it installs the VPN service
-//   HiddifyCoreEngine.exe -DHIDDIFY_LAUNCHER_GUI: the proxy engine in a process of its own
-//                         (`core` command), shown as Hiddify Core Engine with the core icon,
-//                         beside the app
+//   Windows (windows-amd64 in the Makefile; named after the fork, so that no process of Sandpiper
+//   shares a name with an installed Hiddify)
+//   SandpiperCore.exe       console tool, prints parseCli's result
+//   SandpiperAdmin.exe      -DHIDDIFY_LAUNCHER_GUI: GUI subsystem, with a requireAdministrator
+//                           manifest, so the UAC dialog shows "Sandpiper" and the app icon and no
+//                           console window flashes; it installs the VPN service, which runs it
+//   SandpiperCoreEngine.exe -DHIDDIFY_LAUNCHER_GUI: the proxy engine in a process of its own
+//                           (`core` command), shown as Sandpiper Core Engine with the core icon,
+//                           beside the app
 //
 //   macOS (the app's macos/scripts/embed-core-helper.sh)
 //   Hiddify Core.app      -DHIDDIFY_LAUNCHER_LIBRARY=... -DHIDDIFY_LAUNCHER_MACOS_APP: the same core

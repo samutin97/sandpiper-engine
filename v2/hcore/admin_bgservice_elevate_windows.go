@@ -13,6 +13,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// adminLauncherName is the elevation helper beside the console launcher (the core's Makefile,
+// WIN_ADMINNAME).
+const adminLauncherName = "SandpiperAdmin.exe"
+
 // elevateAdminBgInstall shows one UAC prompt and waits for install to finish.
 //
 // It uses ShellExecuteExW with the "runas" verb directly. The previous
@@ -22,12 +26,13 @@ import (
 // PowerShell", "privilege escalation via Start-Process") are written for.
 func elevateAdminBgInstall(cliPath, owner string) error {
 	args := "admin_bgservice install " + quoteWindowsArg(owner)
-	// HiddifyAdmin.exe (GUI subsystem, requireAdministrator manifest, app icon) is the binary
+	// SandpiperAdmin.exe (GUI subsystem, requireAdministrator manifest, app icon) is the binary
 	// shown in the UAC dialog and the one the service is registered with; it forwards to the
-	// same parseCli(). Every package ships it beside HiddifyCore.exe: no fallback to HiddifyCore.exe.
-	exe := filepath.Join(filepath.Dir(cliPath), "HiddifyAdmin.exe")
+	// same parseCli(). Every package ships it beside SandpiperCore.exe: no fallback to the console
+	// launcher, and never upstream's HiddifyAdmin.exe.
+	exe := filepath.Join(filepath.Dir(cliPath), adminLauncherName)
 	if _, err := os.Stat(exe); err != nil {
-		return fmt.Errorf("HiddifyAdmin.exe could not be found in %s; reinstall Hiddify: %w", filepath.Dir(cliPath), err)
+		return fmt.Errorf("%s could not be found in %s; reinstall Sandpiper: %w", adminLauncherName, filepath.Dir(cliPath), err)
 	}
 	exitCode, err := shellExecuteRunAsWait(exe, args)
 	if err != nil {
@@ -86,7 +91,7 @@ func shellExecuteRunAsWait(exe, params string) (uint32, error) {
 	verb, _ := syscall.UTF16PtrFromString("runas")
 	file, _ := syscall.UTF16PtrFromString(exe)
 	parameters, _ := syscall.UTF16PtrFromString(params)
-	// NoZoneChecks: HiddifyAdmin.exe from a downloaded portable zip or a network share carries the
+	// NoZoneChecks: SandpiperAdmin.exe from a downloaded portable zip or a network share carries the
 	// mark of the web. ShellExecuteEx then wants to show the "Open File - Security Warning" dialog,
 	// which FlagNoUI suppresses, and returns ERROR_CANCELLED as if the UAC prompt was refused
 	// ("Administrator permission was not given"). The app beside it is already running, so the

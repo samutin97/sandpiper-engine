@@ -31,9 +31,9 @@ func controlDataDir() string {
 		if base == "" {
 			base = `C:\ProgramData`
 		}
-		return filepath.Join(base, "Hiddify", "AdminBgService")
+		return filepath.Join(base, "Sandpiper", "AdminBgService") // never upstream Hiddify's secret
 	default:
-		return "/var/lib/hiddify-admin-bgservice"
+		return "/var/lib/sandpiper-admin-bgservice"
 	}
 }
 
@@ -89,12 +89,12 @@ func LoadControlSecret() (string, error) {
 		return foregroundSecret, nil
 	}
 	secret, err := os.ReadFile(controlSecretPath())
-	if err != nil {
+	if err != nil && runtime.GOOS == "darwin" { // Windows/Linux: never upstream Hiddify's folders
 		legacy := filepath.Join(legacyControlDataDir(), controlSecretFileName)
 		secret, err = os.ReadFile(legacy)
-		if err != nil {
-			return "", err
-		}
+	}
+	if err != nil {
+		return "", err
 	}
 	if len(secret) < adminbg.MinSecretLength {
 		return "", fmt.Errorf("admin_bgservice control secret is too short")

@@ -4,8 +4,12 @@ BASENAME=$(PRODUCT_NAME)
 BINDIR=bin
 LIBNAME=$(PRODUCT_NAME)
 CLINAME=HiddifyCli
-# Windows' console launcher (cmd/launcher/main.c); HiddifyCli.exe in older cores
-WIN_CLINAME=HiddifyCore
+# Windows launchers (cmd/launcher/main.c), named after the fork so that none of its processes, nor
+# the service, shares a name with an installed Hiddify: the console tool, the administrator helper
+# that installs the service (and that the service runs) and the proxy engine's process.
+WIN_CLINAME=SandpiperCore
+WIN_ADMINNAME=SandpiperAdmin
+WIN_ENGINENAME=SandpiperCoreEngine
 
 BRANCH=$(shell git branch --show-current)
 VERSION=$(shell git describe --tags || echo "unknown version")
@@ -174,15 +178,15 @@ windows-amd64: prepare windows-winres
 	# antivirus engines whatever its link flags; the C launcher scans clean. Each links its
 	# go-winres .syso (icon, VERSIONINFO, manifest).
 	x86_64-w64-mingw32-gcc -O2 -Wall -mconsole -o $(BINDIR)/$(WIN_CLINAME).exe ./cmd/launcher/main.c ./cmd/launcher/cli_windows_amd64.syso -L $(BINDIR) -l:$(LIBNAME).dll -lshell32
-	# HiddifyAdmin.exe: GUI subsystem, requireAdministrator manifest and the app icon; the only
-	# binary that triggers a UAC prompt (VPN service install).
-	x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -municode -DHIDDIFY_LAUNCHER_GUI -o $(BINDIR)/HiddifyAdmin.exe ./cmd/launcher/main.c ./cmd/launcher/admin_windows_amd64.syso -L $(BINDIR) -l:$(LIBNAME).dll -lshell32
-	# HiddifyCoreEngine.exe: the proxy engine's process, GUI subsystem (no console window), shown as
-	# Hiddify Core Engine with the core icon. It replaced core/Hiddify.exe, which shared the app's name.
+	# $(WIN_ADMINNAME).exe: GUI subsystem, requireAdministrator manifest and the app icon; the only
+	# binary that triggers a UAC prompt (VPN service install), and the one the service runs.
+	x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -municode -DHIDDIFY_LAUNCHER_GUI -o $(BINDIR)/$(WIN_ADMINNAME).exe ./cmd/launcher/main.c ./cmd/launcher/admin_windows_amd64.syso -L $(BINDIR) -l:$(LIBNAME).dll -lshell32
+	# $(WIN_ENGINENAME).exe: the proxy engine's process, GUI subsystem (no console window), shown as
+	# Sandpiper Core Engine with the core icon.
 	rm -rf $(BINDIR)/core
-	x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -municode -DHIDDIFY_LAUNCHER_GUI -o $(BINDIR)/HiddifyCoreEngine.exe ./cmd/launcher/main.c ./cmd/launcher/core_windows_amd64.syso -L $(BINDIR) -l:$(LIBNAME).dll -lshell32
-	if [ ! -f $(BINDIR)/$(LIBNAME).dll -o ! -f $(BINDIR)/$(WIN_CLINAME).exe -o ! -f $(BINDIR)/HiddifyAdmin.exe -o ! -f $(BINDIR)/HiddifyCoreEngine.exe -o ! -f $(BINDIR)/libcronet.dll ]; then \
-		echo "Error: $(LIBNAME).dll, $(WIN_CLINAME).exe, HiddifyAdmin.exe, HiddifyCoreEngine.exe or libcronet.dll missing"; \
+	x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -municode -DHIDDIFY_LAUNCHER_GUI -o $(BINDIR)/$(WIN_ENGINENAME).exe ./cmd/launcher/main.c ./cmd/launcher/core_windows_amd64.syso -L $(BINDIR) -l:$(LIBNAME).dll -lshell32
+	if [ ! -f $(BINDIR)/$(LIBNAME).dll -o ! -f $(BINDIR)/$(WIN_CLINAME).exe -o ! -f $(BINDIR)/$(WIN_ADMINNAME).exe -o ! -f $(BINDIR)/$(WIN_ENGINENAME).exe -o ! -f $(BINDIR)/libcronet.dll ]; then \
+		echo "Error: $(LIBNAME).dll, $(WIN_CLINAME).exe, $(WIN_ADMINNAME).exe, $(WIN_ENGINENAME).exe or libcronet.dll missing"; \
 		exit 1; \
 	fi
 

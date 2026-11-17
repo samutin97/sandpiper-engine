@@ -19,7 +19,7 @@ var moduleAnchor byte
 // cronet-go loads libcronet.dll lazily and looks for it only beside the executable and on PATH.
 // The core ran in core\Hiddify.exe, a subfolder of the app, while hiddify-core.dll and
 // libcronet.dll stayed in the app folder, so Naive outbounds failed with "cronet: library not
-// found. Place libcronet.dll in the executable directory or PATH". HiddifyCoreEngine.exe and the app
+// found. Place libcronet.dll in the executable directory or PATH". SandpiperCoreEngine.exe and the app
 // sit beside the DLL now, which returns early below; a launcher elsewhere still needs it. The launcher's
 // SetDllDirectoryW does not help: cronet-go checks file paths itself. Prepending to PATH keeps
 // the load lazy (profiles without Naive never map the library).

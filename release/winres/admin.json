@@ -8,10 +8,10 @@
     "#1": {
       "0409": {
         "identity": {
-          "name": "Hiddify.HiddifyAdmin",
+          "name": "Sandpiper.SandpiperAdmin",
           "version": "0.0.0.0"
         },
-        "description": "Hiddify VPN service setup (administrator)",
+        "description": "Sandpiper service setup (administrator)",
         "minimum-os": "win7",
         "execution-level": "requireAdministrator",
         "ui-access": false,
@@ -31,13 +31,13 @@
         },
         "info": {
           "0409": {
-            "CompanyName": "Hiddify",
-            "FileDescription": "Hiddify Core Service",
-            "InternalName": "HiddifyAdmin",
-            "LegalCopyright": "Copyright (C) Hiddify.com. All rights reserved.",
-            "OriginalFilename": "HiddifyAdmin.exe",
-            "ProductName": "Hiddify",
-            "Comments": "https://github.com/hiddify/hiddify-core"
+            "CompanyName": "Sandpiper",
+            "FileDescription": "Sandpiper Service",
+            "InternalName": "SandpiperAdmin",
+            "LegalCopyright": "Sandpiper contributors, GPL-3.0",
+            "OriginalFilename": "SandpiperAdmin.exe",
+            "ProductName": "Sandpiper",
+            "Comments": "A modified build of hiddify-core"
           }
         }
       }

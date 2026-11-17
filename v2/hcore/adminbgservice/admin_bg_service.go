@@ -334,12 +334,15 @@ func makeTunnelConfig(in *AdminBgStartRequest) option.Options {
 					Type: C.RuleTypeDefault,
 					DefaultOptions: option.DefaultRule{
 						RawDefaultRule: option.RawDefaultRule{
+							// this app's own processes, never an installed Hiddify's (Hiddify.exe,
+							// HiddifyCore.exe on Windows): the macOS app and the Linux CLI keep
+							// upstream's names for now
 							ProcessName: []string{
-								"Hiddify.exe",
+								"Sandpiper.exe",
+								"SandpiperCore.exe",
+								"SandpiperCoreEngine.exe",
 								"Hiddify",
 								"HiddifyCli",
-								"HiddifyCli.exe", // Windows, older cores
-								"HiddifyCore.exe",
 							},
 						},
 						RuleAction: option.RuleAction{
@@ -420,5 +423,6 @@ func tunInterfaceName() string {
 	if runtime.GOOS == "darwin" {
 		return ""
 	}
-	return "HiddifyAdminBg"
+	// not upstream's HiddifyAdminBg: two adapters of one name would collide
+	return "SandpiperAdminBg"
 }

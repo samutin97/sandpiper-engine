@@ -18,7 +18,11 @@ import (
 	hutils "github.com/hiddify/hiddify-core/v2/hutils"
 )
 
-const adminBgServicePort uint16 = 18020
+// The VPN service's loopback port. Upstream Hiddify's service listens on 18020; a Sandpiper beside an
+// installed Hiddify must neither take that port nor talk to Hiddify's service. The app and the
+// other packages here use the same number (adminbgservice, core_interface_desktop_tun.dart,
+// AdminBgServiceController.swift).
+const adminBgServicePort uint16 = 18420
 
 // IsAdmin reports whether this core process runs with administrator/root rights. The app
 // is in the same process, so it asks here instead of spawning `id -u` or PowerShell, which
@@ -224,9 +228,9 @@ func adminBgDataDir() string {
 		if base == "" {
 			base = `C:\ProgramData`
 		}
-		return filepath.Join(base, "Hiddify", "AdminBgService")
+		return filepath.Join(base, "Sandpiper", "AdminBgService") // not upstream Hiddify's folder
 	default:
-		return "/var/lib/hiddify-admin-bgservice"
+		return "/var/lib/sandpiper-admin-bgservice"
 	}
 }
 
@@ -334,7 +338,7 @@ func writeAdminBgConnectRequest(req *EnsureAdminBgServiceRequest) (string, error
 	if err != nil {
 		return "", err
 	}
-	f, err := os.CreateTemp("", "hiddify-admin-bgservice-*.json")
+	f, err := os.CreateTemp("", "sandpiper-admin-bgservice-*.json")
 	if err != nil {
 		return "", err
 	}

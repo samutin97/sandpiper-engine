@@ -24,7 +24,9 @@ type hiddifyNext struct {
 	secret  string
 }
 
-var port int = 18020
+// port is the service's loopback API: the fork's own, never the 18020 of upstream Hiddify's
+// service, which may run on the same computer.
+var port int = 18420
 
 func allowAdminBgMethod(method string) error {
 	switch method {
@@ -139,8 +141,15 @@ func installOwner() string {
 
 // osServiceName is the OS service id passed to kardianos/service.
 // On Linux systemd, that library writes Name+".service" (do not include the suffix here).
+//
+// Windows and Linux: the fork's own, so that it never stops, replaces or removes the service of an
+// upstream Hiddify installed on the same computer (HiddifyAdminBG), nor is taken for it. macOS keeps
+// the upstream label until the macOS app is renamed (its install scripts and bundle use it).
 func osServiceName() string {
-	return "HiddifyAdminBG"
+	if runtime.GOOS == "darwin" {
+		return "HiddifyAdminBG"
+	}
+	return "SandpiperAdminBG"
 }
 
 func serviceRunArguments() []string {
@@ -164,9 +173,9 @@ func StartAdminBgService(goArg string) (int, string) {
 	// macOS: the copied .app must get --tunnel so AppDelegate runs parseCli instead of the Flutter UI.
 	svcConfig := &service.Config{
 		Name:             osServiceName(),
-		DisplayName:      "Hiddify VPN",
+		DisplayName:      serviceDisplayName(),
 		Arguments:        serviceRunArguments(),
-		Description:      "Hiddify virtual private network",
+		Description:      serviceDescription(),
 		WorkingDirectory: dataDirectory,
 		Option: map[string]interface{}{
 			"RunAtLoad":     true,
@@ -265,4 +274,19 @@ func control(s service.Service, goArg string) (int, string) {
 		return 0, fmt.Sprintf("Tunnel Service %sed Successfully.", goArg)
 	}
 	return 2, fmt.Sprintf("Error: %v", err)
+}
+
+// serviceDisplayName and serviceDescription: what Windows' Services list shows (macOS: as upstream).
+func serviceDisplayName() string {
+	if runtime.GOOS == "darwin" {
+		return "Hiddify VPN"
+	}
+	return "Sandpiper Service"
+}
+
+func serviceDescription() string {
+	if runtime.GOOS == "darwin" {
+		return "Hiddify virtual private network"
+	}
+	return "Runs the tunnel the Sandpiper app starts in VPN mode."
 }

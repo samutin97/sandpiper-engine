@@ -8,10 +8,10 @@
     "#1": {
       "0409": {
         "identity": {
-          "name": "Hiddify.CoreEngine",
+          "name": "Sandpiper.CoreEngine",
           "version": "0.0.0.0"
         },
-        "description": "Hiddify Core Engine",
+        "description": "Sandpiper Core Engine",
         "minimum-os": "win7",
         "execution-level": "",
         "ui-access": false,
@@ -31,13 +31,13 @@
         },
         "info": {
           "0409": {
-            "CompanyName": "Hiddify",
-            "FileDescription": "Hiddify Core Engine",
-            "InternalName": "HiddifyCoreEngine",
-            "LegalCopyright": "Copyright (C) Hiddify.com. All rights reserved.",
-            "OriginalFilename": "HiddifyCoreEngine.exe",
-            "ProductName": "Hiddify",
-            "Comments": "https://github.com/hiddify/hiddify-core"
+            "CompanyName": "Sandpiper",
+            "FileDescription": "Sandpiper Core Engine",
+            "InternalName": "SandpiperCoreEngine",
+            "LegalCopyright": "Sandpiper contributors, GPL-3.0",
+            "OriginalFilename": "SandpiperCoreEngine.exe",
+            "ProductName": "Sandpiper",
+            "Comments": "A modified build of hiddify-core"
           }
         }
       }
