@@ -88,6 +88,7 @@ const (
 	LastResortRetry  = 5 * time.Minute  // on last resort past its max: the way up is checked this often
 	NoneFirst        = time.Minute      // nothing works: the first wait before trying again
 	NoneMax          = 15 * time.Minute // nothing works: the longest wait
+	HeldMax          = 5 * time.Minute  // the group held for the user's agreement: the longest wait
 	maxNetworks      = 16
 	upChecksPerTurn  = 2 // checks of the proxies above in one turn of the way up
 )
@@ -451,18 +452,6 @@ func (c *Controller) clearMark(cand Candidate) {
 	c.saveMemory()
 }
 
-func (c *Controller) clearUp(to int) {
-	m := c.mem()
-	for i := 0; i <= to && i < len(c.plan.Candidates); i++ {
-		delete(m.Down, c.plan.Candidates[i].Tag)
-	}
-	if !c.plan.Candidates[to].UDP {
-		m.TCPBlocked = time.Time{}
-	}
-	m.Updated = c.env.Now()
-	c.saveMemory()
-}
-
 // needsConsent: a last resort the user has to agree to first; until then it is not even checked
 // (a check is already a handshake with the server).
 func (c *Controller) needsConsent(cand Candidate) bool {
@@ -559,7 +548,14 @@ func (c *Controller) walk(ctx context.Context, retry bool) {
 		cand := c.plan.Candidates[consent]
 		c.waiting = cand.Tag
 		c.hold()
-		c.logf("last resort %s waits for the user: no connection meanwhile", cand.Tag)
+		// held, there is no connection at all (no proxy that may come back by itself): the proxies
+		// above are tried again at least every HeldMax, so a device nobody watches is back within
+		// minutes of its server
+		if c.noneWait > HeldMax {
+			c.noneWait = HeldMax
+			c.nextUp = c.env.Now().Add(HeldMax)
+		}
+		c.logf("last resort %s waits for the user: no connection meanwhile; again in %s", cand.Tag, c.noneWait)
 		c.setState(State{Tier: cand.Tier, Mode: cand.Mode, Reason: ReasonConfirm, Confirm: cand.Tag, Down: c.downTags(), Network: c.network.ID})
 		return
 	}
@@ -764,7 +760,17 @@ func (c *Controller) use(i int) {
 		return
 	}
 	if err := c.env.Select(cand.Tag); err != nil {
-		c.logf("select %s: %v", cand.Tag, err)
+		// not selected: nothing changes, and the choice is made again later, as when nothing
+		// works (a proxy still in use is checked again then; failing, a walk follows)
+		c.logf("select %s: %v; trying again later", cand.Tag, err)
+		c.scheduleNone()
+		if c.active >= 0 {
+			c.nextCheck = c.nextUp
+			c.publish()
+		} else {
+			c.setState(State{Tier: -1, Reason: ReasonNone, Down: c.downTags(), Network: c.network.ID})
+		}
+		return
 	}
 	if c.active != i {
 		c.since = c.env.Now()
@@ -844,8 +850,7 @@ func (c *Controller) wayUp(ctx context.Context, limit int) {
 			c.logf("way up, second check of %s: %s", c.plan.Candidates[i].Tag, r.Outcome)
 			if r.Outcome.Works() {
 				c.slow = r.Outcome == Slow
-				c.clearUp(i)
-				c.use(i)
+				c.use(i) // takes the mark of the proxy checked (only), and TCP's with a TCP one
 				return
 			}
 			c.upFailed(now)
@@ -874,7 +879,6 @@ func (c *Controller) wayUp(ctx context.Context, limit int) {
 		if nothing {
 			// nothing works now: one pass is enough
 			c.slow = r.Outcome == Slow
-			c.clearUp(i)
 			c.use(i)
 			return
 		}

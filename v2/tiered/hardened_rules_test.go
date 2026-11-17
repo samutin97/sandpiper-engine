@@ -3,6 +3,8 @@ package tiered
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -171,15 +173,25 @@ func TestTierAgreementDuringATry(t *testing.T) {
 	}
 }
 
-// An hour of nothing in one network makes the waits long (15 min); in another network they start
-// from the shortest again.
+// the sample without its last resort: nothing waits for the user, the group is never held
+func planWithoutTheLastResort(t *testing.T) *Plan {
+	p, err := Parse(strings.Replace(samplePolicy, "; t=last-resort,confirm,max=60:10", "", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.Bind(sampleTags, sampleUDP)
+}
+
+// An hour of nothing in one network makes the waits long (15 min; 5 while the group is held for the
+// user); in another network they start from the shortest again.
 func TestTierNoneWaitStartsOverInANewNetwork(t *testing.T) {
 	env := newFakeEnv(t)
 	env.script = func(string, time.Time) (Outcome, time.Duration) { return NoConnect, 3 * time.Second }
-	c := started(t, env, nil)
+	c := New(env, planWithoutTheLastResort(t), nil)
+	c.SetEnabled(context.Background(), true)
 	env.runFor(context.Background(), c, time.Hour)
-	if c.noneWait < NoneMax {
-		t.Fatalf("wait after an hour: %s", c.noneWait)
+	if c.noneWait != NoneMax || c.State().Reason != ReasonNone {
+		t.Fatalf("wait after an hour: %s, %+v", c.noneWait, c.State())
 	}
 	env.network = Network{ID: "net-b", Online: true}
 	c.NetworkChanged(context.Background())
@@ -346,4 +358,99 @@ func TestPolicyCanonicalStaysWithinTheLimit(t *testing.T) {
 	if _, err := Parse(p.Canonical()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// Held for the user's agreement there is no connection at all: the proxies above are tried again
+// at least every HeldMax (not up to 15 min), so the connection comes back by itself within minutes
+// of the server; without the hold the waits still grow to NoneMax.
+func TestTierHeldIsTriedAgainOften(t *testing.T) {
+	env := newFakeEnv(t)
+	serverBack := false
+	env.script = func(tag string, _ time.Time) (Outcome, time.Duration) {
+		if serverBack && number(tag) == "2" {
+			return OK, time.Second
+		}
+		return NoConnect, 3 * time.Second
+	}
+	c := started(t, env, nil)
+	if env.selected != held {
+		t.Fatalf("selected %q", env.selected)
+	}
+	env.runFor(context.Background(), c, 2*time.Hour)
+	if c.noneWait != HeldMax || c.NextWake().Sub(env.now) > HeldMax {
+		t.Fatalf("held: wait %s, next in %s", c.noneWait, c.NextWake().Sub(env.now))
+	}
+	if checkedTheLastResort(env) {
+		t.Fatal("the last resort was checked")
+	}
+	// the server comes back: the connection follows within HeldMax and a turn's checks
+	serverBack = true
+	back := env.now
+	for env.selected == held && env.now.Sub(back) < time.Hour {
+		env.runFor(context.Background(), c, 10*time.Second)
+	}
+	if env.selected != "2 Bravo gRPC" || env.now.Sub(back) > HeldMax+30*time.Second {
+		t.Fatalf("selected %q after %s", env.selected, env.now.Sub(back))
+	}
+}
+
+// The way up takes the mark of the proxy it checked, not of the ones above it it did not check.
+func TestTierWayUpTakesOnlyTheCheckedMark(t *testing.T) {
+	env := newFakeEnv(t)
+	down := map[string]bool{"2": true, "3": true, "1": true}
+	env.script = func(tag string, _ time.Time) (Outcome, time.Duration) {
+		if down[number(tag)] {
+			return NoConnect, 3 * time.Second
+		}
+		return OK, time.Second
+	}
+	c := started(t, env, nil)
+	if env.selected != "4 Delta XHTTP compact" {
+		t.Fatalf("selected %q", env.selected)
+	}
+	// 3 (second in the order) comes back; 2 and 1 still fail
+	delete(down, "3")
+	env.runFor(context.Background(), c, 40*time.Minute)
+	if env.selected != "3 Charlie XHTTP" {
+		t.Fatalf("selected %q", env.selected)
+	}
+	marked := c.downTags()
+	if !slices.Contains(marked, "2 Bravo gRPC") || slices.Contains(marked, "3 Charlie XHTTP") {
+		t.Fatalf("marked %q", marked)
+	}
+	if s := c.State(); s.Reason != ReasonNodeFailed {
+		t.Fatalf("state %+v", s)
+	}
+}
+
+// A selection that fails is not taken for one: the state stays, and the choice is made again.
+func TestTierFailedSelectIsTriedAgain(t *testing.T) {
+	env := newFakeEnv(t)
+	broken := true
+	selectEnv := &failingSelect{fakeEnv: env, broken: &broken}
+	c := New(selectEnv, samplePlan(t), nil)
+	c.SetEnabled(context.Background(), true)
+	if env.selected != "" || c.State().Reason != ReasonNone || c.active >= 0 {
+		t.Fatalf("selected %q, state %+v", env.selected, c.State())
+	}
+	if wait := c.NextWake().Sub(env.now); wait <= 0 || wait > NoneFirst {
+		t.Fatalf("next try in %s", wait)
+	}
+	broken = false
+	env.runFor(context.Background(), c, 2*time.Minute)
+	if env.selected != "2 Bravo gRPC" || c.State().Reason != ReasonOK {
+		t.Fatalf("selected %q, state %+v", env.selected, c.State())
+	}
+}
+
+type failingSelect struct {
+	*fakeEnv
+	broken *bool
+}
+
+func (f *failingSelect) Select(tag string) error {
+	if *f.broken {
+		return errors.New("the group is being replaced")
+	}
+	return f.fakeEnv.Select(tag)
 }

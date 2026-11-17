@@ -464,8 +464,9 @@ func TestTierNothingWorks(t *testing.T) {
 	}
 	checks := len(env.checks)
 	env.runFor(context.Background(), c, time.Hour)
-	// tried again 1, 2, 4, 8, 15, 15... minutes apart, at most three checks a turn
-	if extra := len(env.checks) - checks; extra < 4 || extra > 21 {
+	// held for the user: tried again 1, 2, 4, 5, 5... minutes apart (14 turns in the hour), at most
+	// three checks a turn
+	if extra := len(env.checks) - checks; extra < 4 || extra > 3*14 {
 		t.Fatalf("%d checks in an hour of nothing", extra)
 	}
 	// waiting for the user: the group is held, on no proxy
