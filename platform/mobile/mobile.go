@@ -52,8 +52,10 @@ func Setup(opt *SetupOptions, platformInterface libbox.PlatformInterface) error 
 // 	return state, err
 // }
 
+// Start starts the core without the app (Always-on, a restart after the process was killed), in
+// the context Setup made with the platform interface (see hcore.SetupContext).
 func Start(configPath string, configContent string) error {
-	_, err := hcore.StartService(libbox.BaseContext(nil), &hcore.StartRequest{
+	_, err := hcore.StartService(hcore.SetupContext(), &hcore.StartRequest{
 		ConfigPath:    configPath,
 		ConfigContent: configContent,
 	})
