@@ -148,7 +148,9 @@ func TestKeepTopMakesClientEndpointsLazy(t *testing.T) {
 			lazy[out.Tag] = true
 		}
 	}
-	want := map[string]bool{"a": true, "b": true, "wg": false, "ovpn": true, "warp": true, "wg-server": false}
+	// hardened: the WireGuard client is lazy because it is outside the automatic groups
+	// (lazyQuietTunnels), not by keep top
+	want := map[string]bool{"a": true, "b": true, "wg": true, "ovpn": true, "warp": true, "wg-server": false}
 	for tag, wantLazy := range want {
 		if got, found := lazy[tag]; (found || wantLazy) && got != wantLazy {
 			t.Errorf("%s lazy = %v, want %v", tag, got, wantLazy)
@@ -236,6 +238,14 @@ func TestKeepTopOffWhenTheProfileHasNoMoreProxiesThanItKeeps(t *testing.T) {
 		}
 		lazy := 0
 		for _, end := range options.Endpoints {
+			// hardened: a WireGuard client outside the automatic groups is lazy anyway
+			// (lazyQuietTunnels), whatever keep top does; the server one never
+			if udpEndpointTypes[end.Type] {
+				if end.Lazy != (end.Tag == "wg") {
+					t.Errorf("keep-top %d: %s lazy %v", tc.keepTop, end.Tag, end.Lazy)
+				}
+				continue
+			}
 			if end.Lazy {
 				lazy++
 			}

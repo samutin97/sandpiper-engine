@@ -132,3 +132,23 @@ func tieredMembers(options *option.Options) []string {
 	}
 	return nil
 }
+
+// SP5-02: an AmneziaWG endpoint outside the automatic groups (a reserve, the last resort) is lazy:
+// nothing talks to its server until a connection or a test goes through it, and it closes again when
+// idle. In the automatic groups (asked for), it runs as before.
+func TestQuietTunnelsAreLazy(t *testing.T) {
+	profile := `{"outbounds":[
+	 {"type":"vless","tag":"1 v","server":"192.0.2.10","server_port":443,"uuid":"00000000-0000-4000-8000-000000000001","tls":{"enabled":true,"server_name":"example.com"}},
+	 {"type":"vless","tag":"2 v","server":"192.0.2.11","server_port":443,"uuid":"00000000-0000-4000-8000-000000000002","tls":{"enabled":true,"server_name":"example.com"}}],
+	 "endpoints":[` + strings.Replace(awgEndpointJSON, `"tag":"AWG 990"`, `"tag":"10 AWG"`, 1) + `]}`
+	for _, settings := range []string{`{"enable-tun":true}`, tierSettings(t, "v=1;t=auto:1,2;t=last-resort,confirm:10")} {
+		options := buildPanelProfile(t, profile, settings)
+		if len(options.Endpoints) != 1 || !options.Endpoints[0].Lazy {
+			t.Fatalf("%s: the AWG endpoint is not lazy", settings)
+		}
+	}
+	options := buildPanelProfile(t, profile, `{"enable-tun":true,"udp-endpoints-in-auto":true}`)
+	if options.Endpoints[0].Lazy {
+		t.Fatal("an AWG endpoint in the automatic groups is lazy")
+	}
+}

@@ -311,6 +311,8 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 	// 	},
 	// }
 	autoTags := autoGroupTags(tags, profileAuto, manualOnly)
+	// the tunnels outside the automatic groups talk to their servers only while used
+	lazyQuietTunnels(endpoints, autoTags)
 	if options.Experimental != nil && options.Experimental.Monitoring != nil {
 		// the proxies outside lowest and balance: tested when selected or asked for, not in cycles
 		options.Experimental.Monitoring.OnDemandTags = onDemandProxyTags(tags, autoTags)
@@ -630,6 +632,31 @@ func monitoringWorkers(hopt *HiddifyOptions) int {
 		return 4
 	}
 	return hopt.MonitoringWorkers
+}
+
+// lazyQuietTunnels makes the AmneziaWG and WireGuard client endpoints outside the automatic groups
+// lazy (the fork's lazy endpoints): only their options until a connection or a test goes through
+// them, closed again once idle. A tunnel's device started with the box handshakes with its server,
+// and an endpoint tests itself when it comes up: a reserve nobody chose, the last resort above all,
+// talked to its server at every start and kept a keepalive to it, which marks the server's address
+// for anyone who watches UDP. A chain hop is never lazy (see isChainHop).
+func lazyQuietTunnels(endpoints []option.Endpoint, autoTags []string) {
+	auto := map[string]bool{}
+	for _, tag := range autoTags {
+		auto[tag] = true
+	}
+	for i := range endpoints {
+		end := &endpoints[i]
+		if !udpEndpointTypes[end.Type] || auto[end.Tag] || isChainHop(end.Tag) {
+			continue
+		}
+		switch options := end.Options.(type) {
+		case *option.AwgEndpointOptions:
+			end.Lazy = options.ListenPort == 0
+		case *option.WireGuardEndpointOptions:
+			end.Lazy = options.ListenPort == 0
+		}
+	}
 }
 
 // udpEndpointTypes are the endpoints kept out of the automatic groups and the regular tests.
