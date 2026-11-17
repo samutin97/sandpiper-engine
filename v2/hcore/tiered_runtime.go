@@ -896,7 +896,14 @@ func (e *tierEnv) CheckPath(ctx context.Context) tiered.PathVerdict {
 		return tiered.PathUnknown
 	}
 	response := DpiProbe(ctx, &DpiProbeRequest{Host: e.setup.host, Path: e.setup.path, Attempts: 1, TimeoutMs: 5000})
-	switch response.GetOutcome() {
+	return pathVerdictOf(response.GetOutcome())
+}
+
+// pathVerdictOf is what a probe's outcome says of the path: only a failure on the path itself
+// blocks it; "busy" (another probe, or the budget spent waiting for a turn in the handshake gate),
+// "budget" and errors say nothing.
+func pathVerdictOf(outcome string) tiered.PathVerdict {
+	switch outcome {
 	case "ok":
 		return tiered.PathOK
 	case "freeze_16k", "stall", "reset", "tcp_timeout", "tcp_reset", "tls_timeout", "tls_reset":

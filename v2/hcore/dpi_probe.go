@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -89,7 +90,10 @@ const (
 	probeConnectionsPerAttempt = 2
 )
 
-// budget is the longest a probe takes: each stage's timeout, for every connection it may open.
+// budget is the longest a probe takes: each stage's timeout, for every connection it may open. A
+// connection's turn in the handshake gate is waited for on it too; with one attempt and 5 s a stage
+// (the tiered controller's check of the path, which needs no upload: one connection) that leaves
+// some 15 s for a queue before the stages, more than the gate's window of 5 s takes.
 func (p *probe) budget() time.Duration {
 	return time.Duration(p.attempts*probeConnectionsPerAttempt*probeStagesPerConnection)*p.timeout + time.Second
 }
@@ -140,6 +144,21 @@ func newProbe(in *DpiProbeRequest) *probe {
 		}
 	}
 	return p
+}
+
+// stageDialer is the TCP stage of a probe's connection: the connect within the stage's timeout,
+// noting that it began (the handshake gate may make the dial wait for a turn before it).
+type stageDialer struct {
+	N.Dialer
+	timeout time.Duration
+	started atomic.Bool
+}
+
+func (d *stageDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	d.started.Store(true)
+	ctx, cancel := context.WithTimeout(ctx, d.timeout)
+	defer cancel()
+	return d.Dialer.DialContext(ctx, network, destination)
 }
 
 // dialer is the core's direct dialer when it runs (a protected socket on Android, outside the
@@ -198,11 +217,20 @@ func (p *probe) connect(ctx context.Context, response *DpiProbeResponse, stage f
 	}
 	response.Connections++
 
+	// the turn in the handshake gate is taken before the connect, on the probe's own budget, not on
+	// a stage's timeout: a queue of the core's own handshakes (a test of every proxy, a reconnection)
+	// is no sign of the path, and waiting for it within the TLS stage's 5 s made a "tls_timeout",
+	// which the tiered controller read as TCP to the server cut. The stage timeouts count from the
+	// connect; the handshake then waits only for the gap since the previous ClientHello.
 	end := stage("tcp")
-	dialCtx, cancel := context.WithTimeout(ctx, p.timeout)
-	conn, err := probeDialer().DialContext(dialCtx, N.NetworkTCP, M.ParseSocksaddrHostPort(p.host, p.port))
-	cancel()
+	dialer := &stageDialer{Dialer: probeDialer(), timeout: p.timeout}
+	conn, err := tls.DialForHandshake(ctx, dialer, M.ParseSocksaddrHostPort(p.host, p.port))
 	if err != nil {
+		if !dialer.started.Load() {
+			// the budget ran out in the queue, before any packet went to the server: no verdict
+			end("busy", 0, err)
+			return nil, "busy"
+		}
 		outcome := classifyNetError(err)
 		end(outcome, 0, err)
 		return nil, "tcp_" + outcome
