@@ -2,7 +2,9 @@ package tiered
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -445,8 +447,8 @@ func TestTierNothingWorks(t *testing.T) {
 	}
 	checks := len(env.checks)
 	env.runFor(context.Background(), c, time.Hour)
-	// tried again 1, 2, 4, 8, 15, 15... minutes apart, two checks a turn
-	if extra := len(env.checks) - checks; extra < 4 || extra > 16 {
+	// tried again 1, 2, 4, 8, 15, 15... minutes apart, at most three checks a turn
+	if extra := len(env.checks) - checks; extra < 4 || extra > 21 {
 		t.Fatalf("%d checks in an hour of nothing", extra)
 	}
 	if env.selected != "" {
@@ -461,5 +463,125 @@ func TestTierStateJSON(t *testing.T) {
 	}
 	if errors.Is(nil, context.Canceled) {
 		t.Fatal()
+	}
+}
+
+// SP5-08: after a spell of UDP being cut (9 and 10 marked), TCP fails too: 9 is tried again, the
+// oldest mark first, not left out until its mark ends; the tunnel is never left with nothing to try.
+func TestTierMarksArePriorityNotBan(t *testing.T) {
+	env := newFakeEnv(t)
+	tcpOut, udpOut := true, true
+	env.script = func(tag string, _ time.Time) (Outcome, time.Duration) {
+		if sampleUDP(tag) && udpOut || !sampleUDP(tag) && tcpOut {
+			return NoConnect, 3 * time.Second
+		}
+		return OK, time.Second
+	}
+	env.path = func(time.Time) (PathVerdict, time.Duration) {
+		if tcpOut {
+			return PathBlocked, 3 * time.Second
+		}
+		return PathOK, time.Second
+	}
+	c := started(t, env, nil)
+	if s := c.State(); s.Reason != ReasonConfirm {
+		t.Fatalf("both out: %+v", s)
+	}
+	// the user agrees, the last resort fails too
+	c.Confirm(context.Background(), "10 Juliet WG")
+	if s := c.State(); s.Reason != ReasonNone || len(s.Down) == 0 {
+		t.Fatalf("after the last resort: %+v", s)
+	}
+	// both come back: the next try finds the top
+	tcpOut, udpOut = false, false
+	env.runFor(context.Background(), c, 3*time.Minute)
+	if env.selected != "2 Bravo gRPC" {
+		t.Fatalf("not back: %q, %+v", env.selected, c.State())
+	}
+	// 10 minutes later TCP is cut again; 9 and 10 still carry their marks from the spell
+	env.runFor(context.Background(), c, 5*time.Minute)
+	tcpOut = true
+	before := env.now
+	env.checks = nil
+	env.runFor(context.Background(), c, 10*time.Minute)
+	if env.selected != "9 India HTTP3" {
+		t.Fatalf("left with nothing: %q, %+v, checks %q", env.selected, c.State(), env.checks)
+	}
+	if c.State().Reason == ReasonNone {
+		t.Fatalf("state %+v", c.State())
+	}
+	if took := env.now.Sub(before); took > 11*time.Minute {
+		t.Fatalf("took %s", took)
+	}
+}
+
+// Every proxy marked from an earlier spell (a new run with the memory): the switch turned on finds
+// one that works at once, no minute of "none" first.
+func TestTierStaleMarksDoNotStall(t *testing.T) {
+	env := newFakeEnv(t)
+	store := &memStore{}
+	mem := map[string]*netMemory{"net-a": {Down: map[string]time.Time{}, TCPBlocked: env.now.Add(time.Hour), Updated: env.now}}
+	for _, tag := range []string{"2 Bravo gRPC", "9 India HTTP3", "10 Juliet WG"} {
+		mem["net-a"].Down[tag] = env.now.Add(20 * time.Minute)
+	}
+	store.data, _ = json.Marshal(mem)
+	c := started(t, env, store)
+	// the oldest mark first: TCP's (an hour ago) before 2's own (25 min ago), so 3, at once
+	if env.selected != "3 Charlie XHTTP" || len(env.checks) != 1 || c.State().Reason == ReasonNone {
+		t.Fatalf("selected %q, state %+v, checks %q", env.selected, c.State(), env.checks)
+	}
+	// TCP's mark is gone with the TCP proxy that worked; 2 keeps its own, 9 its own
+	if s := c.State(); slices.Contains(s.Down, "1 Alpha gRPC compact") || !slices.Contains(s.Down, "2 Bravo gRPC") || !slices.Contains(s.Down, "9 India HTTP3") {
+		t.Fatalf("marks kept: %+v", s)
+	}
+}
+
+// A mark ends by itself: a proxy that did not answer for NodeDownTTL, TCP out for TransportDownTTL.
+func TestTierMarksEnd(t *testing.T) {
+	if NodeDownTTL < 30*time.Minute || NodeDownTTL > time.Hour || TransportDownTTL <= NodeDownTTL || TransportDownTTL > 3*time.Hour {
+		t.Fatalf("ttl %s / %s", NodeDownTTL, TransportDownTTL)
+	}
+	env := newFakeEnv(t)
+	env.script = func(tag string, _ time.Time) (Outcome, time.Duration) {
+		if number(tag) == "2" {
+			return NoConnect, 2 * time.Second
+		}
+		return OK, time.Second
+	}
+	c := started(t, env, nil)
+	if !slices.Contains(c.State().Down, "2 Bravo gRPC") {
+		t.Fatalf("not marked: %+v", c.State())
+	}
+	env.now = env.now.Add(NodeDownTTL + time.Minute)
+	if c.isDown(c.plan.Candidates[0]) {
+		t.Fatal("the mark outlived its time")
+	}
+}
+
+// The user's agreement to the last resort holds for the core's run: a reload makes a new controller.
+func TestTierConsentOutlivesAReload(t *testing.T) {
+	env := newFakeEnv(t)
+	env.script = func(tag string, _ time.Time) (Outcome, time.Duration) {
+		if number(tag) == "10" {
+			return OK, time.Second
+		}
+		return NoConnect, 2 * time.Second
+	}
+	agreed := ""
+	c := New(env, samplePlan(t), nil)
+	c.OnConsent = func(tag string) { agreed = tag }
+	c.SetEnabled(context.Background(), true)
+	if !slices.Equal(c.NeedsConsent(), []string{"10 Juliet WG"}) {
+		t.Fatalf("needs consent %q", c.NeedsConsent())
+	}
+	c.Confirm(context.Background(), "10 Juliet WG")
+	if agreed != "10 Juliet WG" || len(c.NeedsConsent()) != 0 {
+		t.Fatalf("agreed %q", agreed)
+	}
+	c2 := New(env, samplePlan(t), nil)
+	c2.Consent(agreed)
+	c2.SetEnabled(context.Background(), true)
+	if env.selected != "10 Juliet WG" || c2.State().Reason == ReasonConfirm {
+		t.Fatalf("asked again: %q, %+v", env.selected, c2.State())
 	}
 }

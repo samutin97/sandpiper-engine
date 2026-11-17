@@ -72,7 +72,10 @@ type Store interface {
 
 // Timings of the controller that the policy does not set.
 const (
-	MemoryTTL       = 6 * time.Hour    // how long a network remembers a proxy that failed
+	NodeDownTTL      = 45 * time.Minute // a proxy that did not answer: tried after the others for this long
+	TransportDownTTL = 2 * time.Hour    // TCP to the server confirmed out (frozen or cut) in a network
+	MemoryTTL        = TransportDownTTL // a network is forgotten when its last mark is this old
+	retryChecks      = 3                // checks of the proxies marked down in one walk
 	ConfirmPass     = time.Minute      // between the two checks that bring a proxy above back
 	LastResortRetry = 5 * time.Minute  // on last resort past its max: the way up is checked this often
 	NoneFirst       = time.Minute      // nothing works: the first wait before trying again
@@ -124,6 +127,9 @@ type netMemory struct {
 type Controller struct {
 	// OnChange, when set, is called after the state changed (to tell the app at once).
 	OnChange func()
+	// OnConsent, when set, is called when the user agreed to a last-resort proxy: the core keeps the
+	// agreement for the rest of its run (a reload makes a new controller, see Consent).
+	OnConsent func(tag string)
 
 	env   Env
 	plan  *Plan
@@ -146,7 +152,6 @@ type Controller struct {
 	upCursor  int
 	upPassed  string // the proxy above that passed one check; the second brings it back
 	noneWait  time.Duration
-	confirmAt int // no proxy in use: the candidates above this index are tried again now and then
 }
 
 // New makes a controller of plan. store may be nil.
@@ -156,6 +161,9 @@ func New(env Env, plan *Plan, store Store) *Controller {
 	c.setState(State{Tier: -1, Reason: ReasonIdle})
 	return c
 }
+
+// Consent records that the user already agreed to the last-resort proxy tag in this run of the core.
+func (c *Controller) Consent(tag string) { c.confirms[tag] = true }
 
 // State is the state for the app; safe from any goroutine.
 func (c *Controller) State() State {
@@ -207,7 +215,7 @@ func (c *Controller) Evaluate(ctx context.Context, why string) {
 		return
 	}
 	c.logf("choosing (%s), network %s", why, c.network.ID)
-	c.walk(ctx, 0, false)
+	c.walk(ctx, false)
 }
 
 // NetworkChanged: the default network changed (or came back).
@@ -246,6 +254,9 @@ func (c *Controller) Confirm(ctx context.Context, tag string) bool {
 		return false
 	}
 	c.confirms[tag] = true
+	if c.OnConsent != nil {
+		c.OnConsent(tag)
+	}
 	c.logf("the user agreed to %s", tag)
 	c.Evaluate(ctx, "the user agreed to the last resort")
 	return true
@@ -293,7 +304,8 @@ func (c *Controller) Tick(ctx context.Context) {
 	now := c.env.Now()
 	if c.active < 0 {
 		if r := c.State().Reason; (r == ReasonNone || r == ReasonConfirm) && !c.nextUp.IsZero() && !now.Before(c.nextUp) {
-			c.wayUp(ctx, min(c.confirmAt, len(c.plan.Candidates)))
+			c.logf("trying again: nothing worked %s ago", c.noneWait)
+			c.walk(ctx, true)
 		}
 		return
 	}
@@ -307,6 +319,7 @@ func (c *Controller) Tick(ctx context.Context) {
 		}
 		if r.Outcome.Works() {
 			c.slow = r.Outcome == Slow
+			c.clearMark(cand)
 			c.nextCheck = c.env.Now().Add(c.plan.Params.Check)
 			c.publish()
 		} else {
@@ -317,7 +330,7 @@ func (c *Controller) Tick(ctx context.Context) {
 				c.publish()
 			case verdictAborted:
 			default:
-				c.walk(ctx, 0, false)
+				c.walk(ctx, false)
 			}
 			return
 		}
@@ -349,28 +362,57 @@ func (c *Controller) mem() *netMemory {
 	return m
 }
 
-// isDown: the candidate failed in this network lately (by itself, or as a TCP proxy while TCP is out).
+// A mark is a priority, not a ban: the proxies marked down in this network are tried after the
+// others, the oldest mark first, never left out while the policy has nothing else to try. A proxy
+// that did not answer is marked for NodeDownTTL; TCP to the server confirmed out marks every TCP
+// proxy for TransportDownTTL; any check that works takes its mark away.
+
+// isDown: the candidate is marked in this network (by itself, or as a TCP proxy while TCP is out).
 func (c *Controller) isDown(cand Candidate) bool {
+	return !c.markUntil(cand).IsZero()
+}
+
+// markUntil is when the candidate's mark ends, zero without one.
+func (c *Controller) markUntil(cand Candidate) time.Time {
 	m := c.mem()
 	now := c.env.Now()
-	if until, ok := m.Down[cand.Tag]; ok && now.Before(until) {
-		return true
+	var until time.Time
+	if u, ok := m.Down[cand.Tag]; ok && now.Before(u) {
+		until = u
 	}
-	return !cand.UDP && now.Before(m.TCPBlocked)
+	if !cand.UDP && now.Before(m.TCPBlocked) && m.TCPBlocked.After(until) {
+		until = m.TCPBlocked
+	}
+	return until
 }
 
 func (c *Controller) tcpBlocked() bool { return c.env.Now().Before(c.mem().TCPBlocked) }
 
 func (c *Controller) markDown(tag string) {
 	m := c.mem()
-	m.Down[tag] = c.env.Now().Add(MemoryTTL)
+	m.Down[tag] = c.env.Now().Add(NodeDownTTL)
 	m.Updated = c.env.Now()
 	c.saveMemory()
 }
 
 func (c *Controller) markTCP() {
 	m := c.mem()
-	m.TCPBlocked = c.env.Now().Add(MemoryTTL)
+	m.TCPBlocked = c.env.Now().Add(TransportDownTTL)
+	m.Updated = c.env.Now()
+	c.saveMemory()
+}
+
+// clearMark: the candidate works, so its mark goes; a TCP proxy that works also clears TCP.
+func (c *Controller) clearMark(cand Candidate) {
+	m := c.mem()
+	_, marked := m.Down[cand.Tag]
+	if !marked && (cand.UDP || m.TCPBlocked.IsZero()) {
+		return
+	}
+	delete(m.Down, cand.Tag)
+	if !cand.UDP {
+		m.TCPBlocked = time.Time{}
+	}
 	m.Updated = c.env.Now()
 	c.saveMemory()
 }
@@ -387,98 +429,203 @@ func (c *Controller) clearUp(to int) {
 	c.saveMemory()
 }
 
-// walk tries the candidates from index from, skipping the ones down in this network, and selects
-// the first that carries data. pathDone: the path to the server was already checked in this walk.
-func (c *Controller) walk(ctx context.Context, from int, pathDone bool) {
-	stalls := map[string]bool{}
-	pathChecked := pathDone
-	pathVerdict := PathUnknown
-	for i := from; i < len(c.plan.Candidates); i++ {
-		cand := c.plan.Candidates[i]
-		if c.isDown(cand) {
+// needsConsent: a last resort the user has to agree to first; until then it is not even checked
+// (a check is already a handshake with the server).
+func (c *Controller) needsConsent(cand Candidate) bool {
+	return cand.Mode == ModeLastResort && cand.Confirm && !c.confirms[cand.Tag]
+}
+
+// NeedsConsent are the tags of the last-resort proxies still waiting for the user's agreement:
+// nothing may test them meanwhile.
+func (c *Controller) NeedsConsent() []string {
+	var tags []string
+	for _, cand := range c.plan.Candidates {
+		if c.needsConsent(cand) {
+			tags = append(tags, cand.Tag)
+		}
+	}
+	return tags
+}
+
+// walkState is what one walk learned.
+type walkState struct {
+	tried       map[int]bool
+	stalls      map[string]bool
+	pathChecked bool
+	pathVerdict PathVerdict
+	tcpNow      bool // this walk found TCP to the server out
+	checks      int
+}
+
+// walk tries the candidates and selects the first that carries data: first the ones not marked in
+// this network, in the policy's order, then the marked ones, the oldest mark first, a last resort
+// after the others (at most
+// retryChecks of them, a TCP one only if this walk did not just find TCP out). A last resort that
+// waits for the user's agreement is offered only when nothing else worked. retry: a later try while
+// nothing works, one check a proxy, at most retryChecks in all.
+func (c *Controller) walk(ctx context.Context, retry bool) {
+	w := &walkState{tried: map[int]bool{}, stalls: map[string]bool{}}
+	attempts := c.plan.Params.Fail
+	if retry {
+		attempts = 1
+	}
+	consent := -1
+	for i, cand := range c.plan.Candidates {
+		if c.needsConsent(cand) {
+			if consent < 0 {
+				consent = i
+			}
 			continue
 		}
-		if cand.Mode == ModeLastResort && cand.Confirm && !c.confirms[cand.Tag] {
-			// not even checked before the user agrees: a check is already a handshake with the
-			// server. Meanwhile the proxies above are tried again now and then.
-			c.logf("last resort %s waits for the user", cand.Tag)
-			c.active = -1
-			c.confirmAt = i
-			c.upCursor, c.upPassed = 0, ""
-			c.scheduleNone()
-			c.setState(State{Tier: cand.Tier, Mode: cand.Mode, Reason: ReasonConfirm, Confirm: cand.Tag, Down: c.downTags(), Network: c.network.ID})
-			return
+		if c.isDown(cand) || (w.tcpNow && !cand.UDP) {
+			continue
 		}
-		c.setState(State{Tier: cand.Tier, Mode: cand.Mode, Node: cand.Tag, Reason: ReasonChecking, Checking: true, Down: c.downTags(), Network: c.network.ID})
-		v := verdictDown
-		for attempt := 0; attempt < c.plan.Params.Fail; attempt++ {
-			if attempt > 0 {
-				if c.env.Sleep(ctx, c.plan.Params.Retry) != nil {
-					return
-				}
-			}
-			if c.networkMoved() {
-				c.Evaluate(ctx, "network changed")
-				return
-			}
-			r := c.env.Check(ctx, cand.Tag)
-			if ctx.Err() != nil {
-				return
-			}
-			c.logf("%s: %s", cand.Tag, r.Outcome)
-			if r.Outcome.Works() {
-				c.slow = r.Outcome == Slow
-				v = verdictWorks
-				break
-			}
-			if cand.UDP {
-				continue
-			}
-			// a TCP proxy that stalled or got no answer: is it the proxy, or TCP to the server?
-			if !pathChecked {
-				pathChecked = true
-				pathVerdict = c.env.CheckPath(ctx)
-				if ctx.Err() != nil {
-					return
-				}
-				c.logf("the path to the server: %s", [...]string{"unknown", "ok", "blocked"}[pathVerdict])
-				if c.networkMoved() {
-					c.Evaluate(ctx, "network changed")
-					return
-				}
-			}
-			if pathVerdict == PathBlocked {
-				v = verdictTCP
-				break
-			}
-			if pathVerdict == PathUnknown && r.Outcome == Stall {
-				// no verdict of the path: a stall is a strong sign by itself, so on at once; two
-				// TCP proxies that stall in a row make TCP out
-				stalls[cand.Tag] = true
-				if len(stalls) >= 2 {
-					v = verdictTCP
-				}
-				break
-			}
+		if retry && w.checks >= retryChecks {
+			break
 		}
-		switch v {
+		switch c.try(ctx, w, i, attempts) {
 		case verdictWorks:
 			c.use(i)
 			return
-		case verdictTCP:
-			c.logf("TCP to the server is out in this network: on to UDP")
-			c.markTCP()
-		default:
-			c.markDown(cand.Tag)
+		case verdictAborted:
+			return
 		}
 	}
-	// nothing works: the choice stays, and the top is tried again later
+	budget := retryChecks
+	if retry {
+		budget = max(retryChecks-w.checks, 0)
+	}
+	for _, i := range c.markedOrder(w) {
+		if budget <= 0 {
+			break
+		}
+		if w.tcpNow && !c.plan.Candidates[i].UDP {
+			continue // found out in this walk
+		}
+		budget--
+		c.logf("trying %s again although it failed here lately", c.plan.Candidates[i].Tag)
+		switch c.try(ctx, w, i, 1) {
+		case verdictWorks:
+			c.use(i)
+			return
+		case verdictAborted:
+			return
+		}
+	}
 	c.active = -1
-	c.confirmAt = len(c.plan.Candidates)
-	c.upCursor, c.upPassed = 0, ""
 	c.scheduleNone()
+	if consent >= 0 {
+		cand := c.plan.Candidates[consent]
+		c.logf("last resort %s waits for the user", cand.Tag)
+		c.setState(State{Tier: cand.Tier, Mode: cand.Mode, Reason: ReasonConfirm, Confirm: cand.Tag, Down: c.downTags(), Network: c.network.ID})
+		return
+	}
+	// nothing works: the choice stays, and everything is tried again later
 	c.logf("no proxy of the policy works; again in %s", c.noneWait)
 	c.setState(State{Tier: -1, Reason: ReasonNone, Down: c.downTags(), Network: c.network.ID})
+}
+
+// markedOrder are the marked candidates this walk did not try, the oldest mark first.
+func (c *Controller) markedOrder(w *walkState) []int {
+	var order []int
+	for i, cand := range c.plan.Candidates {
+		if w.tried[i] || c.needsConsent(cand) || (w.tcpNow && !cand.UDP) || !c.isDown(cand) {
+			continue
+		}
+		order = append(order, i)
+	}
+	// the oldest mark first, a last resort after the others, then the policy's order
+	sort.SliceStable(order, func(a, b int) bool {
+		ca, cb := c.plan.Candidates[order[a]], c.plan.Candidates[order[b]]
+		if la, lb := ca.Mode == ModeLastResort, cb.Mode == ModeLastResort; la != lb {
+			return lb
+		}
+		return c.markedAt(ca).Before(c.markedAt(cb))
+	})
+	return order
+}
+
+// markedAt is when the candidate got the newest of the marks it carries now.
+func (c *Controller) markedAt(cand Candidate) time.Time {
+	m := c.mem()
+	now := c.env.Now()
+	var at time.Time
+	if u, ok := m.Down[cand.Tag]; ok && now.Before(u) {
+		at = u.Add(-NodeDownTTL)
+	}
+	if !cand.UDP && now.Before(m.TCPBlocked) {
+		if t := m.TCPBlocked.Add(-TransportDownTTL); t.After(at) {
+			at = t
+		}
+	}
+	return at
+}
+
+// try checks candidate i up to attempts times and marks it, or TCP, when it fails.
+func (c *Controller) try(ctx context.Context, w *walkState, i int, attempts int) verdict {
+	cand := c.plan.Candidates[i]
+	w.tried[i] = true
+	c.setState(State{Tier: cand.Tier, Mode: cand.Mode, Node: cand.Tag, Reason: ReasonChecking, Checking: true, Down: c.downTags(), Network: c.network.ID})
+	v := verdictDown
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			if c.env.Sleep(ctx, c.plan.Params.Retry) != nil {
+				return verdictAborted
+			}
+		}
+		if c.networkMoved() {
+			c.Evaluate(ctx, "network changed")
+			return verdictAborted
+		}
+		w.checks++
+		r := c.env.Check(ctx, cand.Tag)
+		if ctx.Err() != nil {
+			return verdictAborted
+		}
+		c.logf("%s: %s", cand.Tag, r.Outcome)
+		if r.Outcome.Works() {
+			c.slow = r.Outcome == Slow
+			c.clearMark(cand)
+			return verdictWorks
+		}
+		if cand.UDP {
+			continue
+		}
+		// a TCP proxy that stalled or got no answer: is it the proxy, or TCP to the server?
+		if !w.pathChecked {
+			w.pathChecked = true
+			w.pathVerdict = c.env.CheckPath(ctx)
+			if ctx.Err() != nil {
+				return verdictAborted
+			}
+			c.logf("the path to the server: %s", [...]string{"unknown", "ok", "blocked"}[w.pathVerdict])
+			if c.networkMoved() {
+				c.Evaluate(ctx, "network changed")
+				return verdictAborted
+			}
+		}
+		if w.pathVerdict == PathBlocked {
+			v = verdictTCP
+			break
+		}
+		if w.pathVerdict == PathUnknown && r.Outcome == Stall {
+			// no verdict of the path: a stall is a strong sign by itself, so on at once; two
+			// TCP proxies that stall in a row make TCP out
+			w.stalls[cand.Tag] = true
+			if len(w.stalls) >= 2 {
+				v = verdictTCP
+			}
+			break
+		}
+	}
+	if v == verdictTCP {
+		c.logf("TCP to the server is out in this network: on to UDP")
+		w.tcpNow = true
+		c.markTCP()
+	} else {
+		c.markDown(cand.Tag)
+	}
+	return v
 }
 
 // scheduleNone plans the next try while no proxy is in use: 1 min, then twice as long, up to 15.
@@ -548,6 +695,7 @@ func (c *Controller) use(i int) {
 	if cand.Mode == ModeLastResort && cand.Max > 0 {
 		c.nextUp = c.since.Add(min(max(c.plan.Params.Hold, c.upWait), cand.Max))
 	}
+	c.clearMark(cand)
 	c.logf("using %s (tier %d, %s)", cand.Tag, cand.Tier+1, cand.Mode)
 	c.publish()
 }
@@ -626,7 +774,7 @@ func (c *Controller) wayUp(ctx context.Context, limit int) {
 	}
 	for _, i := range order[:min(len(order), upChecksPerTurn)] {
 		cand := c.plan.Candidates[i]
-		if cand.Mode == ModeLastResort && cand.Confirm && !c.confirms[cand.Tag] {
+		if c.needsConsent(cand) {
 			continue
 		}
 		r := c.env.Check(ctx, cand.Tag)
