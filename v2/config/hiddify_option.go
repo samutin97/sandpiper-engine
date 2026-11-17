@@ -83,7 +83,8 @@ type HiddifyOptions struct {
 	// set one: the fingerprint's own (hybrid) by default, or "classical" (no X25519MLKEM768).
 	TLSKeyShare string `json:"tls-key-share,omitempty"`
 	// HandshakeGate paces the TLS handshakes to one server (on unless false): at most
-	// HandshakeGateMax at a time (3), HandshakeGateGapMs between their starts (450).
+	// HandshakeGateMax at a time (1), at least HandshakeGateGapMs between their starts (700, drawn
+	// up to 400 ms more), at most 4 in 5 s (builder.go, handshakeGate).
 	HandshakeGate      *bool `json:"handshake-gate,omitempty"`
 	HandshakeGateMax   int   `json:"handshake-gate-max,omitempty"`
 	HandshakeGateGapMs int   `json:"handshake-gate-gap-ms,omitempty"`

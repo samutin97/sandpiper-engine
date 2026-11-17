@@ -542,17 +542,53 @@ func setExperimental(options *option.Options, hopt *HiddifyOptions) {
 	setProcs(options)
 }
 
-// handshakeGate paces the TLS handshakes to one server: at most 3 at a time, 450 ms between their
-// starts, unless the user turned it off (handshake-gate false). A Russian DPI freezes a server for
-// two minutes after more than three parallel handshakes to it (research O1).
+// The pacing of the TLS handshakes to one server (the address, whatever the server name), in one
+// place. A DPI rule described for Russian networks freezes a server for a client for minutes after
+// more than three TLS handshakes to it within a minute with less than about 350-400 ms between
+// them (research O1). So:
+//   - one handshake at a time: a connection waits for the previous handshake to end;
+//   - a gap drawn anew between 0.7 and 1.1 s before each handshake: a margin of about twice the
+//     threshold, which a network that squeezes two packets together does not eat, and no fixed
+//     rhythm to match;
+//   - at most 4 handshakes starting in any 5 s: the start of the tunnel, a test of every proxy or
+//     a reconnection after a network change opens its connections in a row, never in a burst.
+//
+// Ordinary work is not slowed: the transports of the subscription (gRPC, XHTTP) keep one or two
+// long-lived multiplexed connections, which handshake once. What waits is a series: the second
+// proxy of the automatic group is tested about 0.3-0.7 s later than with the old 450 ms gap, a test
+// of six proxies takes about 6 s instead of 2.5 s, and a transport without multiplexing
+// (WebSocket, HTTPUpgrade) opens its connections at this pace.
+const (
+	handshakeGateMaxInflight = 1
+	handshakeGateMinGap      = 700 * time.Millisecond
+	handshakeGateMaxGap      = 1100 * time.Millisecond
+	handshakeGateWindow      = 5 * time.Second
+	handshakeGateWindowMax   = 4
+)
+
+// handshakeGate paces the TLS handshakes to one server (see above), unless the user turned it off
+// (handshake-gate false). handshake-gate-max and handshake-gate-gap-ms, when set, replace the
+// number at a time and the shortest gap; the spread of the gap stays.
 func handshakeGate(hopt *HiddifyOptions) *option.HandshakeGateOptions {
 	if hopt.HandshakeGate != nil && !*hopt.HandshakeGate {
 		return nil
 	}
+	maxInflight := handshakeGateMaxInflight
+	if hopt.HandshakeGateMax > 0 {
+		maxInflight = hopt.HandshakeGateMax
+	}
+	minGap, maxGap := handshakeGateMinGap, handshakeGateMaxGap
+	if hopt.HandshakeGateGapMs > 0 {
+		minGap = time.Duration(hopt.HandshakeGateGapMs) * time.Millisecond
+		maxGap = minGap + (handshakeGateMaxGap - handshakeGateMinGap)
+	}
 	return &option.HandshakeGateOptions{
 		Enabled:     true,
-		MaxInflight: hopt.HandshakeGateMax,
-		MinGap:      badoption.Duration(time.Duration(hopt.HandshakeGateGapMs) * time.Millisecond),
+		MaxInflight: maxInflight,
+		MinGap:      badoption.Duration(minGap),
+		MaxGap:      badoption.Duration(maxGap),
+		Window:      badoption.Duration(handshakeGateWindow),
+		WindowMax:   handshakeGateWindowMax,
 	}
 }
 

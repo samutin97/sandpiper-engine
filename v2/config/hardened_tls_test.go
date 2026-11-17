@@ -57,8 +57,13 @@ func TestHandshakeGateOnByDefault(t *testing.T) {
 	if gate == nil || !gate.Enabled {
 		t.Fatal("no handshake gate by default")
 	}
+	// ST4-03: one at a time, a gap drawn in 0.7-1.1 s, at most 4 in 5 s
+	if gate.MaxInflight != 1 || time.Duration(gate.MinGap) != 700*time.Millisecond || time.Duration(gate.MaxGap) != 1100*time.Millisecond ||
+		time.Duration(gate.Window) != 5*time.Second || gate.WindowMax != 4 {
+		t.Fatalf("default %+v", gate)
+	}
 	tuned := buildPerApp(t, `{"handshake-gate-max":2,"handshake-gate-gap-ms":600}`).Experimental.HandshakeGate
-	if tuned.MaxInflight != 2 || time.Duration(tuned.MinGap) != 600*time.Millisecond {
+	if tuned.MaxInflight != 2 || time.Duration(tuned.MinGap) != 600*time.Millisecond || time.Duration(tuned.MaxGap) != 1000*time.Millisecond || tuned.WindowMax != 4 {
 		t.Fatalf("tuned %+v", tuned)
 	}
 	if buildPerApp(t, `{"handshake-gate":false}`).Experimental.HandshakeGate != nil {
