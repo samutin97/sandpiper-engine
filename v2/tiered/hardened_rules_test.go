@@ -242,6 +242,7 @@ func TestTierWalkIsBounded(t *testing.T) {
 	env.path = func(time.Time) (PathVerdict, time.Duration) { return PathUnknown, time.Second }
 	c := New(env, p.Bind(sampleTags, sampleUDP), nil)
 	c.SetEnabled(context.Background(), true)
+	t.Logf("%d checks in %s", len(env.checks), env.elapsed())
 	if n := len(env.checks); n > walkBudget+len(sampleTags) {
 		t.Fatalf("%d checks in one walk", n)
 	}
