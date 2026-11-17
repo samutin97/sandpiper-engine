@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/hiddify/hiddify-core/v2/hcore/buildid"
 	"github.com/hiddify/hiddify-core/v2/hcore/vpnservice"
@@ -39,11 +40,19 @@ func writePublicFile(path string, content []byte) error {
 		_ = os.Remove(next)
 		return err
 	}
-	if err := os.Rename(next, path); err != nil {
-		_ = os.Remove(next)
-		return err
+	// On Windows the rename fails while a reader holds the old file open (the app's core polls the
+	// stamp and the endpoint while the service starts): it is tried again for a second.
+	for attempt := 1; ; attempt++ {
+		err := os.Rename(next, path)
+		if err == nil {
+			return nil
+		}
+		if attempt >= 20 {
+			_ = os.Remove(next)
+			return err
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	return nil
 }
 
 // ReadBinaryStamp returns the build id the running service last wrote.
