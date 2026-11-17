@@ -3,6 +3,7 @@ package hcore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 
 	"github.com/hiddify/hiddify-core/v2/config"
@@ -39,7 +40,17 @@ func BuildConfig(ctx context.Context, in *StartRequest) (*option.Options, error)
 		// Log(LogLevel_DEBUG, LogType_CORE, "Building config ")
 		return config.BuildConfig(ctx, static.HiddifyOptions, readOpt)
 	}
-	return config.ReadSingOptions(ctx, readOpt)
+	// a config run as it is: never on Android and iOS, where its inbounds would open ports for
+	// every app; elsewhere its outbounds and endpoints are checked as a profile's (HC-03)
+	if C.IsAndroid || C.IsIos {
+		return nil, fmt.Errorf("running a raw config is not allowed on this platform")
+	}
+	raw, err := config.ReadSingOptions(ctx, readOpt)
+	if err != nil {
+		return nil, err
+	}
+	raw, _, err = config.SanitizeOptions(ctx, raw)
+	return raw, err
 
 }
 
@@ -66,7 +77,7 @@ func Parse(ctx context.Context, in *ParseRequest) (*ParseResponse, error) {
 		}, err
 	}
 	if in.ConfigPath != "" {
-		err = os.WriteFile(in.ConfigPath, config, 0o644)
+		err = os.WriteFile(in.ConfigPath, config, 0o600) // the profile's keys: private
 		if err != nil {
 			return &ParseResponse{
 				ResponseCode: hcommon.ResponseCode_FAILED,
@@ -104,7 +115,8 @@ func ChangeHiddifySettings(in *ChangeHiddifySettingsRequest, insert bool) (*Core
 		default:
 			static.logLevel.Store(int32(LogLevel_INFO))
 		}
-		static.debug = static.debug || LogLevel(static.logLevel.Load()) <= LogLevel_DEBUG
+		// The log level no longer turns the core's debug mode on (HC-07): debug comes only
+		// from SetupRequest.debug, which the app sets in its own debug build.
 	}()
 
 	if in.HiddifySettingsJson == "" {
@@ -122,6 +134,9 @@ func ChangeHiddifySettings(in *ChangeHiddifySettingsRequest, insert bool) (*Core
 	if err != nil {
 		return nil, err
 	}
+	// enable-clash-api used to open 127.0.0.1:16756; the port is now clash-api-listen's (desktop
+	// only), and the core's own services behind the flag always run (HC-04)
+	static.HiddifyOptions.EnableClashApi = true
 
 	if static.HiddifyOptions.Warp.WireguardConfigStr != "" {
 		err := json.Unmarshal([]byte(static.HiddifyOptions.Warp.WireguardConfigStr), &static.HiddifyOptions.Warp.WireguardConfig)

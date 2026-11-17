@@ -209,10 +209,10 @@ func TestExportDiagnosticsRefusesAKeyThatIsNotAge(t *testing.T) {
 
 func TestReportNamesCountUpAndTheCopyKeepsItsNumber(t *testing.T) {
 	working := t.TempDir()
-	require.Equal(t, "hiddify-001.zip", reportName(working, "stamp", false, false))
-	require.Equal(t, "hiddify-001-unencrypted.zip", reportName(working, "stamp", false, true))
-	require.Equal(t, "hiddify-002.zip", reportName(working, "stamp", false, false))
+	require.Equal(t, "report-001.zip", reportName(working, "stamp", false, false))
+	require.Equal(t, "report-001-unencrypted.zip", reportName(working, "stamp", false, true))
+	require.Equal(t, "report-002.zip", reportName(working, "stamp", false, false))
 	// the background core's zip goes inside a report and takes no number
-	require.Equal(t, "hiddify-stamp.zip", reportName(working, "stamp", true, false))
-	require.Equal(t, "hiddify-003.zip", reportName(working, "stamp", false, false))
+	require.Equal(t, "report-stamp.zip", reportName(working, "stamp", true, false))
+	require.Equal(t, "report-003.zip", reportName(working, "stamp", false, false))
 }

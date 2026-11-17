@@ -2,12 +2,15 @@ package config
 
 import (
 	context "context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	sync "sync"
 	"time"
@@ -42,6 +45,8 @@ const (
 	// sequential groups (selected server, its TCP/TLS variants, then a fallback resolver);
 	// all DNS rules and the DNS final use these
 	DNSMultiDirectTag = "dns-direct-group"
+	// DNSServerNamesTag resolves the names of the VPN servers when server-dns-address is set
+	DNSServerNamesTag = "dns-server-names"
 	DNSMultiRemoteTag = "dns-remote-group"
 	// DoH through the profile alone, past the extra security hop: the remote group's last resort
 	DNSRemoteViaProfileTag = "dns-remote-via-profile"
@@ -82,6 +87,18 @@ func BuildConfig(ctx context.Context, hopts *HiddifyOptions, inputOpt *ReadOptio
 	if err != nil {
 		return nil, err
 	}
+	// the profile's outbounds and endpoints, whatever parser made them, are checked (HC-03, HC-19)
+	input, warnings, err := sanitizeOptions(ctx, input, profilePolicy{allowInsecure: hopts.AllowInsecure})
+	if err != nil {
+		return nil, err
+	}
+	for _, warning := range warnings {
+		fmt.Println("profile: dropped", warning)
+	}
+	// the profile's inbounds, DNS and route are never taken on Android and iOS (HC-03)
+	if isMobile {
+		hopts.EnableFullConfig = false
+	}
 
 	var options option.Options
 	if hopts.EnableFullConfig {
@@ -94,7 +111,9 @@ func BuildConfig(ctx context.Context, hopts *HiddifyOptions, inputOpt *ReadOptio
 	declareIPv6FromInput(&options, input)
 
 	setLog(&options, hopts)
-	setInbound(&options, hopts)
+	if err := setInbound(&options, hopts); err != nil {
+		return nil, err
+	}
 	staticIPs := make(map[string][]string)
 	// staticIPs["api.cloudflareclient.com"] = []string{"104.16.192.82", "2606:4700::6810:1854", getRandomWarpIP()}
 	// setNTP(&options)
@@ -179,6 +198,10 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 	var outbounds []option.Outbound
 	var endpoints []option.Endpoint
 	var tags []string
+	// manualOnly are the proxies kept out of the automatic groups (UDP, see auto_group.go)
+	manualOnly := map[string]bool{}
+	// the subscription's own automatic choice (a panel's urltest "Auto"), nil without one
+	profileAuto := profileURLTestMembers(input.Outbounds)
 	// OutboundMainProxyTag = OutboundSelectTag
 	// inbound==warp over proxies
 	// outbound==proxies over warp
@@ -226,6 +249,9 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 			}
 			if !strings.Contains(out.Tag, "§hide§") {
 				tags = append(tags, out.Tag)
+				if udpProxy(out.Type, out.Options) && !opt.UDPEndpointsInAuto {
+					manualOnly[out.Tag] = true
+				}
 			}
 			outbounds = append(outbounds, out)
 		}
@@ -242,7 +268,11 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 
 		if !strings.Contains(out.Tag, "§hide§") {
 			tags = append(tags, out.Tag)
+			if udpProxy(out.Type, out.Options) && !opt.UDPEndpointsInAuto {
+				manualOnly[out.Tag] = true
+			}
 		}
+		quietUDPEndpoint(out)
 
 		endpoints = append(endpoints, *out)
 	}
@@ -256,12 +286,11 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 	if opt.UseSystemTLSEngine == nil || *opt.UseSystemTLSEngine {
 		systemEngine = usableTLSEngine()
 	}
-	chooseTLSEngines(outbounds, systemEngine)
+	fingerprint, keyShare := tlsDefaults(opt)
+	chooseTLSEnginesWith(outbounds, systemEngine, fingerprint)
+	applyKeyShare(outbounds, keyShare)
 	if len(opt.ConnectionTestUrls) == 0 {
 		opt.ConnectionTestUrls = []string{opt.ConnectionTestUrl, "https://www.google.com/generate_204", "http://captive.apple.com/generate_204", "https://cp.cloudflare.com"}
-		if isBlockedConnectionTestUrl(opt.ConnectionTestUrl) {
-			opt.ConnectionTestUrls = []string{opt.ConnectionTestUrl}
-		}
 	}
 	// urlTest := option.Outbound{
 	// 	Type: C.TypeURLTest,
@@ -277,11 +306,23 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 	// 		InterruptExistConnections: true,
 	// 	},
 	// }
+	autoTags := autoGroupTags(tags, profileAuto, manualOnly)
+	if options.Experimental != nil && options.Experimental.Monitoring != nil {
+		// the proxies outside lowest and balance: tested when selected or asked for, not in cycles
+		options.Experimental.Monitoring.OnDemandTags = onDemandProxyTags(tags, autoTags)
+	}
+	if len(tags) > 1 {
+		source := "every proxy"
+		if len(profileAuto) > 0 {
+			source = "the profile's urltest group"
+		}
+		fmt.Printf("automatic groups: %d of %d proxies (%s, UDP in auto: %v)\n", len(autoTags), len(tags), source, opt.UDPEndpointsInAuto)
+	}
 	urlTest := option.Outbound{
 		Type: C.TypeBalancer,
 		Tag:  OutboundURLTestTag,
 		Options: &option.BalancerOutboundOptions{
-			Outbounds:            tags,
+			Outbounds:            autoTags,
 			Strategy:             "lowest-delay",
 			DelayAcceptableRatio: 2,
 			// URL:       opt.ConnectionTestUrl,
@@ -299,7 +340,7 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 		Type: C.TypeBalancer,
 		Tag:  OutboundRoundRobinTag,
 		Options: &option.BalancerOutboundOptions{
-			Outbounds:            tags,
+			Outbounds:            autoTags,
 			Strategy:             opt.BalancerStrategy,
 			DelayAcceptableRatio: 2,
 			// URL:       opt.ConnectionTestUrl,
@@ -328,7 +369,9 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 		outbounds = append([]option.Outbound{balancer, urlTest}, outbounds...)
 		selectorTags = append([]string{urlTest.Tag, balancer.Tag}, selectorTags...)
 		switch opt.DefaultProxy {
-		case DefaultProxyLowest:
+		case DefaultProxyLowest, "":
+			// unset: the fastest proxy, not the balancer that spread connections over every
+			// proxy of the profile, each protocol in turn (HC-10)
 			defaultSelect = urlTest.Tag
 		case DefaultProxyFirst:
 		default:
@@ -377,6 +420,65 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 	return nil
 }
 
+// quietUDPEndpoint keeps an AmneziaWG endpoint from talking to its server until it is used: its
+// keepalive starts at the first connection (no handshake at every start for an endpoint nobody
+// selected), and no MTU probing through the tunnel when the profile gives the MTU (HC-39).
+func quietUDPEndpoint(end *option.Endpoint) {
+	if options, ok := end.Options.(*option.AwgEndpointOptions); ok {
+		options.KeepaliveOnUse = true
+		if options.MTU > 0 && options.MTUDiscovery == nil {
+			off := false
+			options.MTUDiscovery = &off
+		}
+	}
+}
+
+// autoDetectInterface says whether the core's sockets are bound to the underlying network around
+// its own TUN: on the desktop by the interface, and on Android by the platform, which protects each
+// socket of the dialers (VpnService.protect) and binds it to the default network. On Android it was
+// off, so no socket of the core was protected, and the app had to keep itself out of its own VPN
+// (addDisallowedApplication) or the sockets carrying the tunnel would loop into it; its own
+// requests then went around the tunnel (H-02 of the app audit). With it the app stays in its VPN:
+// the outbounds to the servers, their UDP (hysteria2, tuic, WireGuard, AmneziaWG), the DNS servers
+// and the direct outbound go out protected on the physical network, the app's other requests go
+// through the tunnel. Not on iOS, where the system keeps the extension's sockets out of the tunnel.
+func autoDetectInterface(hopt *HiddifyOptions, android, ios bool) bool {
+	return !ios && (hopt.EnableTun || hopt.EnableTunService)
+}
+
+// regionDomainSuffixes are the domains of a region that go around the VPN from the start, before
+// its rule-sets are downloaded (through the VPN, after the start) and whatever is in them: for
+// Russia every Russian top-level domain (.ru alone left .su, .рф and the city domains to the VPN,
+// and Russian services then saw the VPN server's address, HC-14).
+func regionDomainSuffixes(region string) []string {
+	if region == "ru" {
+		return []string{
+			".ru", ".su", ".xn--p1ai", // .рф
+			".xn--p1acf",                      // .рус
+			".xn--d1acj3b",                    // .дети
+			".xn--80asehdb",                   // .онлайн
+			".xn--80aswg",                     // .сайт
+			".xn--c1avg",                      // .орг
+			".xn--80adxhks",                   // .москва
+			".moscow", ".tatar", ".xn--90ais", // .бел (Belarus, Russian services)
+		}
+	}
+	return []string{"." + region}
+}
+
+// ruleSetInitialPath is the rule-set file of the app's assets (rule-set-initial-dir) to start
+// with, until the first download: empty when the app gives none or it is not there.
+func ruleSetInitialPath(hopt *HiddifyOptions, name string) string {
+	if hopt.RuleSetInitialDir == "" {
+		return ""
+	}
+	path := filepath.Join(hopt.RuleSetInitialDir, name)
+	if info, err := os.Stat(path); err != nil || info.IsDir() {
+		return ""
+	}
+	return path
+}
+
 func isBlockedConnectionTestUrl(d string) bool {
 	u, err := url.Parse(d)
 	if err != nil {
@@ -396,23 +498,19 @@ func contains(slice []string, item string) bool {
 
 func setExperimental(options *option.Options, hopt *HiddifyOptions) {
 	if len(hopt.ConnectionTestUrls) == 0 {
+		// no lookup of the test URL's domain with the system resolver here (isBlockedConnectionTestUrl
+		// did one at every build: a plain DNS query to the provider, HC-34)
 		hopt.ConnectionTestUrls = []string{hopt.ConnectionTestUrl, "http://captive.apple.com/generate_204", "https://cp.cloudflare.com", "https://google.com/generate_204"}
-		if isBlockedConnectionTestUrl(hopt.ConnectionTestUrl) {
-			hopt.ConnectionTestUrls = []string{hopt.ConnectionTestUrl}
-		}
 	}
+	// EnableClashApi now only says whether the core's own services run (traffic statistics through
+	// the clash server, cache file, monitoring); only independent instances turn it off. Whether
+	// the Clash API listens on a TCP port is clashAPIOptions' decision (HC-04).
 	if hopt.EnableClashApi {
-		if hopt.ClashApiSecret == "" {
-			hopt.ClashApiSecret = defaultClashApiSecret()
-		}
 		options.Experimental = &option.ExperimentalOptions{
 			UnifiedDelay: &option.UnifiedDelayOptions{
 				Enabled: true,
 			},
-			ClashAPI: &option.ClashAPIOptions{
-				ExternalController: fmt.Sprintf("%s:%d", "127.0.0.1", hopt.ClashApiPort),
-				Secret:             hopt.ClashApiSecret,
-			},
+			ClashAPI: clashAPIOptions(hopt),
 
 			CacheFile: &option.CacheFileOptions{
 				Enabled: true, // WARP and MASQUE devices are stored by default
@@ -425,13 +523,84 @@ func setExperimental(options *option.Options, hopt *HiddifyOptions) {
 				// each proxy's IPv6 is verified once at its URL test, with the same test URL over
 				// IPv6, when the apps get IPv6 at all (see ipv6ForClients)
 				VerifyIPv6:     ipv6ForClients(hopt.IPv6Mode),
-				Interval:       badoption.Duration(hopt.URLTestInterval.Duration()),
+				Interval:       badoption.Duration(urlTestInterval(hopt)),
 				DebounceWindow: badoption.Duration(time.Millisecond * 500),
-				IdleTimeout:    badoption.Duration(hopt.URLTestInterval.Duration().Nanoseconds() * 3),
+				IdleTimeout:    badoption.Duration(urlTestInterval(hopt).Nanoseconds() * 3),
+				// no "handshake storm" (HC-09, HC-10): two proxies at a time; never the direct
+				// outbounds (their test and IP lookup go from the device's own address); no IP
+				// lookup unless asked for; after a network change only the proxies in use; the
+				// UDP endpoints only when selected or asked for
+				Workers:               monitoringWorkers(hopt),
+				ExcludeTypes:          []string{C.TypeDirect, C.TypeBlock, C.TypeDNS},
+				OnDemandTypes:         onDemandTypes(hopt),
+				RetestOnNetworkChange: retestOnNetworkChange(hopt),
+				DisableIPInfo:         !hopt.IpInfo,
 			},
+			HandshakeGate: handshakeGate(hopt),
 		}
 	}
 	setProcs(options)
+}
+
+// handshakeGate paces the TLS handshakes to one server: at most 3 at a time, 450 ms between their
+// starts, unless the user turned it off (handshake-gate false). A Russian DPI freezes a server for
+// two minutes after more than three parallel handshakes to it (research O1).
+func handshakeGate(hopt *HiddifyOptions) *option.HandshakeGateOptions {
+	if hopt.HandshakeGate != nil && !*hopt.HandshakeGate {
+		return nil
+	}
+	return &option.HandshakeGateOptions{
+		Enabled:     true,
+		MaxInflight: hopt.HandshakeGateMax,
+		MinGap:      badoption.Duration(time.Duration(hopt.HandshakeGateGapMs) * time.Millisecond),
+	}
+}
+
+// defaultURLTestInterval is the time between the regular tests of the proxies, in seconds: 30
+// minutes, and never under minURLTestInterval (it was 10 minutes, to every proxy at once).
+const (
+	defaultURLTestInterval = 1800
+	minURLTestInterval     = 300
+)
+
+func urlTestInterval(hopt *HiddifyOptions) time.Duration {
+	interval := hopt.URLTestInterval.Duration()
+	if interval <= 0 {
+		interval = defaultURLTestInterval * time.Second
+	}
+	if interval < minURLTestInterval*time.Second {
+		interval = minURLTestInterval * time.Second
+	}
+	return interval
+}
+
+// monitoringWorkers is how many proxies are tested at a time: 2 unless set, at most 4.
+func monitoringWorkers(hopt *HiddifyOptions) int {
+	switch {
+	case hopt.MonitoringWorkers <= 0:
+		return 2
+	case hopt.MonitoringWorkers > 4:
+		return 4
+	}
+	return hopt.MonitoringWorkers
+}
+
+// udpEndpointTypes are the endpoints kept out of the automatic groups and the regular tests.
+var udpEndpointTypes = map[string]bool{C.TypeAwg: true, C.TypeWireGuard: true}
+
+func onDemandTypes(hopt *HiddifyOptions) []string {
+	if hopt.UDPEndpointsInAuto {
+		return nil
+	}
+	return []string{C.TypeAwg, C.TypeWireGuard}
+}
+
+func retestOnNetworkChange(hopt *HiddifyOptions) string {
+	switch hopt.RetestOnNetworkChange {
+	case "all", "none", "selected":
+		return hopt.RetestOnNetworkChange
+	}
+	return "selected"
 }
 
 // setProcs lets the core run on as few Go processors as its load needs (one, most of the time)
@@ -533,7 +702,7 @@ func shouldEnableIPv6() bool {
 	return isIPv6Supported()
 }
 
-func setInbound(options *option.Options, hopt *HiddifyOptions) {
+func setInbound(options *option.Options, hopt *HiddifyOptions) error {
 	// var inboundDomainStrategy option.DomainStrategy
 	// if !opt.ResolveDestination {
 	// 	inboundDomainStrategy = option.DomainStrategy(dns.DomainStrategyAsIS)
@@ -558,6 +727,7 @@ func setInbound(options *option.Options, hopt *HiddifyOptions) {
 			// GSO:                    runtime.GOOS != "windows",
 
 		}
+		applyPerAppTun(&opts, hopt)
 		tunInbound := option.Inbound{
 			Type: C.TypeTun,
 			Tag:  InboundTUNTag,
@@ -576,19 +746,21 @@ func setInbound(options *option.Options, hopt *HiddifyOptions) {
 		// default:
 
 		// }
-		opts.Address = []netip.Prefix{
-			netip.MustParsePrefix("172.19.0.1/28"),
-			// Always on the TUN when auto-routing. Without it, sing-tun installs no ::/0
-			// and IPv6 bypasses the VPN (NE builds guard this in Swift; admin_bgservice /
-			// desktop TUN must do it here). ipv6Mode only affects DNS strategy below.
-			netip.MustParsePrefix("fdfe:dcba:9876::1/126"),
-		}
+		// IPv4 and IPv6, always on the TUN when auto-routing. Without the IPv6 one, sing-tun
+		// installs no ::/0 and IPv6 bypasses the VPN (NE builds guard this in Swift;
+		// admin_bgservice / desktop TUN must do it here). ipv6Mode only affects DNS strategy below.
+		// Random per installation with tun-address-seed (tun_address.go).
+		opts.Address = tunAddresses(hopt)
 
 		options.Inbounds = append(options.Inbounds, tunInbound)
 
 	}
 
-	for _, listener := range proxyListeners(hopt, ipv6Enable) {
+	listeners, err := proxyListeners(hopt, ipv6Enable)
+	if err != nil {
+		return err
+	}
+	for _, listener := range listeners {
 		addr := badoption.Addr(listener.addr)
 		options.Inbounds = append(options.Inbounds, option.Inbound{
 			Type: C.TypeMixed,
@@ -597,12 +769,13 @@ func setInbound(options *option.Options, hopt *HiddifyOptions) {
 				ListenOptions:  option.ListenOptions{Listen: &addr, ListenPort: listener.port},
 				Users:          listener.users,
 				SetSystemProxy: listener.systemProxy,
+				DisableUDP:     !listener.udp,
 			},
 		})
 	}
 
 	if !transparentPortsOpen(hopt) {
-		return
+		return nil
 	}
 	// the transparent ports, on the addresses they always had: every one while shared (a Linux
 	// gateway sends the network's traffic to them), this device's own otherwise
@@ -644,6 +817,7 @@ func setInbound(options *option.Options, hopt *HiddifyOptions) {
 			})
 		}
 	}
+	return nil
 }
 
 func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
@@ -689,6 +863,13 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 	// 	},
 	// },
 	// )
+	// first of all: the flows of an app the VPN does not cover, sent into the TUN anyway (leak B),
+	// rejected before any other rule sees them, and before the handshake (see per_app.go)
+	if strictOwnerFilter(hopt) {
+		if tun := tunInboundOptions(options); tun != nil {
+			routeRules = append(routeRules, ownerFilterRules(hopt, tun)...)
+		}
+	}
 	forceDirectRules, err := addForceDirect(options, hopt)
 	if err != nil {
 		return err
@@ -1004,7 +1185,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 	if !useAppRules && hopt.Region != "other" {
 		dnsRules = append(dnsRules, option.DefaultDNSRule{
 			RawDefaultDNSRule: option.RawDefaultDNSRule{
-				DomainSuffix: []string{"." + hopt.Region},
+				DomainSuffix: regionDomainSuffixes(hopt.Region),
 			},
 			DNSRuleAction: option.DNSRuleAction{
 				Action: C.RuleActionTypeRoute,
@@ -1023,7 +1204,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 			Type: C.RuleTypeDefault,
 			DefaultOptions: option.DefaultRule{
 				RawDefaultRule: option.RawDefaultRule{
-					DomainSuffix: []string{"." + hopt.Region},
+					DomainSuffix: regionDomainSuffixes(hopt.Region),
 				},
 				RuleAction: option.RuleAction{
 					Action: C.RuleActionTypeRoute,
@@ -1061,8 +1242,9 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 			Format: C.RuleSetFormatBinary,
 			RemoteOptions: option.RemoteRuleSet{
 				URL:            "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/country/geoip-" + hopt.Region + ".srs",
+				InitialPath:    ruleSetInitialPath(hopt, "geoip-"+hopt.Region+".srs"),
 				UpdateInterval: badoption.Duration(5 * time.Hour * 24),
-				DownloadDetour: OutboundSelectTag,
+				DownloadDetour: OutboundSelectTag, // through the VPN, never from the device's own address
 			},
 		})
 		rulesets = append(rulesets, option.RuleSet{
@@ -1071,8 +1253,9 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 			Format: C.RuleSetFormatBinary,
 			RemoteOptions: option.RemoteRuleSet{
 				URL:            "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/country/geosite-" + hopt.Region + ".srs",
+				InitialPath:    ruleSetInitialPath(hopt, "geosite-"+hopt.Region+".srs"),
 				UpdateInterval: badoption.Duration(5 * time.Hour * 24),
-				DownloadDetour: OutboundSelectTag,
+				DownloadDetour: OutboundSelectTag, // through the VPN
 			},
 		})
 
@@ -1114,9 +1297,9 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 		Rules:               routeRules,
 		Final:               OutboundMainDetour,
 		IPv6Fallback:        ipv6ForClients(hopt.IPv6Mode), // see ipv6ForClients
-		AutoDetectInterface: (!C.IsAndroid && !C.IsIos) && (hopt.EnableTun || hopt.EnableTunService),
+		AutoDetectInterface: autoDetectInterface(hopt, C.IsAndroid, C.IsIos),
 		DefaultDomainResolver: &option.DomainResolveOptions{
-			Server:   DNSMultiDirectTag,
+			Server:   serverNamesResolver(hopt),
 			Strategy: dnsStrategy(hopt.DirectDnsDomainStrategy, hopt.IPv6Mode),
 		},
 		// OverrideAndroidVPN: hopt.EnableTun && C.IsAndroid,
@@ -1294,7 +1477,7 @@ func getIPs(domains ...string) []string {
 }
 
 func isBlockedDomain(domain string) bool {
-	if strings.HasPrefix("full:", domain) {
+	if strings.HasPrefix(domain, "full:") {
 		return false
 	}
 	if strings.Contains(domain, "instagram") || strings.Contains(domain, "facebook") || strings.Contains(domain, "telegram") || strings.Contains(domain, "t.me") {
@@ -1336,25 +1519,74 @@ func removeDuplicateStr(strSlice []string) []string {
 }
 
 // defaultClashApiSecret is generated once per process, so the same settings build the same
-// config (hot reload compares the running config with the new one).
+// config (hot reload compares the running config with the new one): 32 random bytes (HC-35).
 var defaultClashApiSecret = sync.OnceValue(func() string {
-	return generateRandomString(16)
+	return hex.EncodeToString(randomBytes(32))
 })
 
-func generateRandomString(length int) string {
-	// Determine the number of bytes needed
-	bytesNeeded := (length*6 + 7) / 8
+// defaultClashApiPort is a free loopback port, picked once per process for the same reason.
+var defaultClashApiPort = sync.OnceValue(func() uint16 {
+	return freeLoopbackPort()
+})
 
-	// Generate random bytes
-	randomBytes := make([]byte, bytesNeeded)
-	_, err := rand.Read(randomBytes)
-	if err != nil {
-		return "hiddify"
+// clashAPIOptions is the Clash API: always without a listener on Android and iOS, and on the
+// desktop unless the user asked for one (clash-api-listen). Without an external controller the
+// clash server still runs in the core, for the traffic statistics the app reads over gRPC, and
+// opens no port (HC-04). With one: 127.0.0.1 only, a port of its own (the fixed 16756 is what
+// a port scan knows Hiddify by), a secret of 32 random bytes unless the user set a long one, and
+// no cross-origin access from web pages.
+func clashAPIOptions(hopt *HiddifyOptions) *option.ClashAPIOptions {
+	if !clashAPIListens(hopt) {
+		return &option.ClashAPIOptions{}
 	}
+	port := hopt.ClashApiPort
+	if port == 0 || port == legacyClashApiPort {
+		port = defaultClashApiPort()
+	}
+	secret := hopt.ClashApiSecret
+	if len(secret) < 32 {
+		secret = defaultClashApiSecret()
+	}
+	controller := fmt.Sprintf("127.0.0.1:%d", port)
+	return &option.ClashAPIOptions{
+		ExternalController:       controller,
+		Secret:                   secret,
+		AccessControlAllowOrigin: badoption.Listable[string]{"http://" + controller},
+	}
+}
 
-	// Encode random bytes to base64
-	randomString := base64.URLEncoding.EncodeToString(randomBytes)
+// legacyClashApiPort is the port the app used to ask for; a listener asked for keeps off it.
+const legacyClashApiPort = 16756
 
-	// Trim padding characters and return the string
-	return randomString[:length]
+// clashAPIListens says whether the Clash API opens a TCP port: never on Android and iOS, where
+// any app on the device finds it on the loopback; on the desktop only when asked for.
+func clashAPIListens(hopt *HiddifyOptions) bool {
+	return hopt.ClashApiListen && !C.IsAndroid && !C.IsIos
+}
+
+// freeLoopbackPort is a TCP port free on 127.0.0.1 now, or 0 if none could be had.
+func freeLoopbackPort() uint16 {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0
+	}
+	defer listener.Close()
+	return uint16(listener.Addr().(*net.TCPAddr).Port)
+}
+
+// randomBytes are n bytes from crypto/rand; it panics if the system has no randomness, as a
+// secret made from anything else must not be used.
+func randomBytes(n int) []byte {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("crypto/rand: %v", err))
+	}
+	return b
+}
+
+// generateRandomString is a random string of length characters (URL-safe base64 alphabet) from
+// crypto/rand. It used to be math/rand with "hiddify" as its fallback (HC-35).
+func generateRandomString(length int) string {
+	s := base64.RawURLEncoding.EncodeToString(randomBytes((length*6 + 7) / 8))
+	return s[:length]
 }

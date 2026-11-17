@@ -23,7 +23,55 @@ var tlsEngineProtocols = map[string]bool{
 }
 
 // chooseTLSEngines applies the rules above to the outbounds, with the engine this system has ("" for none).
+// The fingerprint a TLS client gets when its profile names none (hardened): Firefox, which the
+// Russian DPI lets through where Chrome-like hellos of "suspicious" networks are slowed (research
+// dpi_bypass_research.md, O5). The key share stays the fingerprint's (hybrid post-quantum) unless
+// tls-key-share is "classical" (a ClientHello of one segment, for networks that cut the second,
+// M4). REALITY keeps its own: the user's Xray server refuses REALITY without X25519MLKEM768.
+const DefaultTLSFingerprint = "firefox"
+
+// tlsDefaults are the fingerprint and key share of the settings, or the defaults.
+func tlsDefaults(hopt *HiddifyOptions) (fingerprint, keyShare string) {
+	fingerprint = hopt.TLSFingerprint
+	if fingerprint == "" {
+		fingerprint = DefaultTLSFingerprint
+	}
+	if hopt.TLSKeyShare == "classical" {
+		keyShare = "classical"
+	}
+	return
+}
+
+// applyKeyShare gives the uTLS clients that are not REALITY the key share of the settings, unless
+// the profile set one.
+func applyKeyShare(outbounds []option.Outbound, keyShare string) {
+	if keyShare == "" {
+		return
+	}
+	for _, outbound := range outbounds {
+		wrapper, hasTLS := outbound.Options.(option.OutboundTLSOptionsWrapper)
+		if !hasTLS {
+			continue
+		}
+		set := func(tls *option.OutboundTLSOptions) {
+			if tls == nil || !tls.Enabled || tls.Reality != nil && tls.Reality.Enabled || tls.UTLS == nil || !tls.UTLS.Enabled || tls.UTLS.KeyShare != "" {
+				return
+			}
+			tls.UTLS.KeyShare = keyShare
+		}
+		set(wrapper.TakeOutboundTLSOptions())
+		if transport := outboundTransport(outbound); transport != nil && transport.Type == C.V2RayTransportTypeXHTTP && transport.XHTTPOptions.Download != nil {
+			set(transport.XHTTPOptions.Download.TakeOutboundTLSOptions())
+		}
+	}
+}
+
 func chooseTLSEngines(outbounds []option.Outbound, systemEngine string) {
+	chooseTLSEnginesWith(outbounds, systemEngine, "chrome")
+}
+
+// chooseTLSEnginesWith is chooseTLSEngines with the fingerprint of a client left to uTLS.
+func chooseTLSEnginesWith(outbounds []option.Outbound, systemEngine, fingerprint string) {
 	for _, outbound := range outbounds {
 		if !tlsEngineProtocols[outbound.Type] {
 			continue
@@ -40,14 +88,14 @@ func chooseTLSEngines(outbounds []option.Outbound, systemEngine string) {
 		if transport != nil && transport.Type == C.V2RayTransportTypeQUIC {
 			continue
 		}
-		chooseTLSEngine(wrapper.TakeOutboundTLSOptions(), dialer, systemEngine)
+		chooseTLSEngine(wrapper.TakeOutboundTLSOptions(), dialer, systemEngine, fingerprint)
 		if transport != nil && transport.Type == C.V2RayTransportTypeXHTTP && transport.XHTTPOptions.Download != nil {
-			chooseTLSEngine(transport.XHTTPOptions.Download.TakeOutboundTLSOptions(), dialer, systemEngine)
+			chooseTLSEngine(transport.XHTTPOptions.Download.TakeOutboundTLSOptions(), dialer, systemEngine, fingerprint)
 		}
 	}
 }
 
-func chooseTLSEngine(tls *option.OutboundTLSOptions, dialer option.DialerOptions, systemEngine string) {
+func chooseTLSEngine(tls *option.OutboundTLSOptions, dialer option.DialerOptions, systemEngine, fingerprint string) {
 	if tls == nil || !tls.Enabled || tls.Engine != "" || (tls.UTLS != nil && tls.UTLS.Enabled) ||
 		(tls.Reality != nil && tls.Reality.Enabled) || slices.Contains(tls.ALPN, "h3") {
 		return
@@ -56,7 +104,7 @@ func chooseTLSEngine(tls *option.OutboundTLSOptions, dialer option.DialerOptions
 		tls.Engine = systemEngine
 		return
 	}
-	tls.UTLS = &option.OutboundUTLSOptions{Enabled: true, Fingerprint: "chrome"}
+	tls.UTLS = &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fingerprint}
 }
 
 // systemTLSCan reports whether the system's TLS can make this connection: sing-box refuses these fields for it

@@ -55,7 +55,7 @@ func publishLog(level LogLevel, typ LogType, message string) {
 		Level:   level,
 		Type:    typ,
 		Time:    timestamppb.New(time.Now()),
-		Message: message,
+		Message: scrubLogLine(message), // no secrets in what the app shows and shares (HC-15)
 	})
 }
 
@@ -125,12 +125,18 @@ func sendLogs(ctx context.Context, logs <-chan *LogMessage, level LogLevel, send
 	}
 }
 
+// dumpGoroutinesToFile writes every goroutine's stack to path, readable by the core's user
+// alone; nothing unless goroutine files are on (debug, or a debug build: goroutineSnapshotsOn).
 func dumpGoroutinesToFile(path string) error {
-	f, err := os.Create(path)
+	if !goroutineSnapshotsOn(static.debug) {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	f.Chmod(0o600)
 
 	return pprof.Lookup("goroutine").WriteTo(f, 2)
 }

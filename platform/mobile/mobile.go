@@ -3,16 +3,18 @@ package mobile
 import (
 	hcore "github.com/hiddify/hiddify-core/v2/hcore"
 
-	_ "net/http/pprof"
-
 	_ "github.com/sagernet/gomobile"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/libbox"
 )
 
 type SetupOptions struct {
-	BasePath        string
-	WorkingDir      string
-	TempDir         string
+	BasePath   string
+	WorkingDir string
+	TempDir    string
+	// DataPath is where the core keeps its own data (settings database, cache file, logs): a
+	// private directory of the app. Empty: BasePath on Android.
+	DataPath        string
 	Listen          string
 	Secret          string
 	Debug           bool
@@ -30,6 +32,7 @@ func Setup(opt *SetupOptions, platformInterface libbox.PlatformInterface) error 
 		BasePath:          opt.BasePath,
 		WorkingDir:        opt.WorkingDir,
 		TempDir:           opt.TempDir,
+		DataPath:          opt.DataPath,
 		FlutterStatusPort: 0,
 		Listen:            opt.Listen,
 		Debug:             opt.Debug,
@@ -60,6 +63,21 @@ func Start(configPath string, configContent string) error {
 func Stop() error {
 	_, err := hcore.Stop()
 	return err
+}
+
+// GetListenAddress is the address the gRPC server of mode really listens on: "unix:/path",
+// "unix-abstract:name" or "127.0.0.1:<port>" (after asking for port 0), "" if it does not run.
+func GetListenAddress(mode int) string {
+	return hcore.GetListenAddress(hcore.SetupMode(mode))
+}
+
+// ProtectsOwnSockets says that this core protects the sockets that carry its tunnel on Android
+// (route auto_detect_interface: VpnService.protect through autoDetectInterfaceControl, and the
+// default network): the app may stay inside its own VPN, and its own requests go through the
+// tunnel (H-02). The app asks it by reflection (com.hiddify.core.mobile.Mobile.protectsOwnSockets);
+// an older core has no such method, and the app then keeps itself out of the VPN as before.
+func ProtectsOwnSockets() bool {
+	return C.IsAndroid
 }
 
 func GetServerPublicKey() []byte {

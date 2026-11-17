@@ -550,3 +550,10 @@ func (h *HiddifyInstance) subscribeAllProxies(streamCtx context.Context, monitor
 	}
 	return nil, E.New("outbound monitoring group not ready")
 }
+
+// GetLocalProxyInfo is the local proxy of the current settings, for the app to show: it may be
+// on a free port with random credentials (hardened fork).
+func (s *CoreService) GetLocalProxyInfo(ctx context.Context, _ *hcommon.Empty) (*LocalProxyInfo, error) {
+	info := config.GetLocalProxyInfo(static.HiddifyOptions)
+	return &LocalProxyInfo{Address: info.Address, Username: info.Username, Password: info.Password, Udp: info.UDP}, nil
+}

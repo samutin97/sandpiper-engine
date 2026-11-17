@@ -30,7 +30,58 @@ var DnsRemoteTags = []string{
 	DNSTricksDirectTag,
 }
 
-var DEFAULT_DNS_TTL = uint32(60 * 60 * 24)
+// DEFAULT_DNS_TTL is the TTL of the answers to the apps: 5 minutes (it was a day, which kept the
+// addresses of CDNs long after they changed, HC-38).
+var DEFAULT_DNS_TTL = uint32(5 * 60)
+
+// Default direct resolvers (when the app sends no direct-dns-address): DNS over HTTPS, with the
+// system resolver as the last resort, never plain DNS to a public resolver. It resolves the VPN
+// servers' addresses and the domains that go around the VPN; in plain UDP to 1.1.1.1 the
+// provider read (and could forge) every server name at each connection (HC-13). In Russia
+// Yandex's DoH: reachable everywhere there (DoT to foreign resolvers and Cloudflare are throttled
+// or blocked on many networks, by the reports of 2025-2026), and an ordinary thing for a Russian
+// phone to use (Yandex Browser, Yandex's DNS settings), so no new mark; it does see the names, as
+// the provider's resolver would. Elsewhere Cloudflare's DoH, by address.
+const (
+	DefaultDirectDNSRussia = "https://common.dot.dns.yandex.net/dns-query"
+	DefaultDirectDNS       = "https://1.1.1.1/dns-query"
+)
+
+// directDNSAddress is the direct resolver of the settings, or the default for the region.
+func directDNSAddress(opt *HiddifyOptions) string {
+	if opt.DirectDnsAddress != "" {
+		return opt.DirectDnsAddress
+	}
+	if opt.Region == "ru" {
+		return DefaultDirectDNSRussia
+	}
+	return DefaultDirectDNS
+}
+
+// isEncryptedDNS: DoH, DoT, DoH3, DoQ.
+func isEncryptedDNS(address string) bool {
+	for _, scheme := range []string{"https://", "tls://", "h3://", "quic://"} {
+		if strings.HasPrefix(address, scheme) {
+			return true
+		}
+	}
+	return false
+}
+
+// encryptedDirectAddresses are the members of the direct group for an encrypted selection: the
+// selection, DoT of the same host for DoH, then the system resolver; no plain query to a public
+// resolver, which only the user can choose.
+func encryptedDirectAddresses(selected string) []string {
+	addresses := []string{selected}
+	if u, err := url.Parse(selected); err == nil && u.Scheme == C.DNSTypeHTTPS && u.Hostname() != "" {
+		host := u.Hostname()
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		addresses = append(addresses, "tls://"+host)
+	}
+	return append(addresses, C.DNSTypeLocal)
+}
 
 func getDnsAddress(d string) string {
 	// the system resolver is no host: "udp://local" was a server named "local"
@@ -67,12 +118,16 @@ func setDns(options *option.Options, opt *HiddifyOptions, staticIps *map[string]
 		return err
 	}
 
-	direct_detour := OutboundDirectFragmentTag
-	if strings.HasPrefix(opt.DirectDnsAddress, "udp://") || !strings.Contains(opt.DirectDnsAddress, "://") {
-		direct_detour = ""
+	directAddress := directDNSAddress(opt)
+	// the direct resolver goes straight, unless the user turned TLS fragmentation on: fragmented
+	// TLS to a resolver nobody blocks only slows it down and marks the device (HC-28)
+	directDetour := func(address string) string {
+		if opt.TLSTricks.EnableFragment && !strings.HasPrefix(address, "udp://") && strings.Contains(address, "://") && address != C.DNSTypeLocal {
+			return OutboundDirectFragmentTag
+		}
+		return ""
 	}
-
-	direct_dns, err := getDNSServerOptions(DNSDirectTag, opt.DirectDnsAddress, DNSLocalTag, direct_detour)
+	direct_dns, err := getDNSServerOptions(DNSDirectTag, directAddress, DNSLocalTag, directDetour(directAddress))
 	if err != nil {
 		return err
 	}
@@ -115,12 +170,27 @@ func setDns(options *option.Options, opt *HiddifyOptions, staticIps *map[string]
 			group.Servers = append(group.Servers, server.Tag)
 		}
 	}
-	directGroup, directMembers, err := getDNSGroupOptions(DNSMultiDirectTag, *direct_dns, opt.DirectDnsAddress, DNSLocalTag, false, func(address string) string {
-		if strings.HasPrefix(address, "udp://") {
-			return ""
+	directAddresses := dnsGroupAddresses(directAddress) // a plain selection keeps its fallbacks
+	if isEncryptedDNS(getDnsAddress(directAddress)) {
+		directAddresses = encryptedDirectAddresses(getDnsAddress(directAddress))
+	}
+	// the system resolver chosen for the direct domains has no plain fallback to a public resolver
+	if directAddress == C.DNSTypeLocal {
+		directAddresses = []string{C.DNSTypeLocal}
+	}
+	var serverMembers []option.DNSServerOptions
+	if addresses := serverDNSAddresses(opt.ServerDnsAddress); len(addresses) > 0 {
+		first, err := getDNSServerOptions(DNSServerNamesTag+"-0", addresses[0], DNSLocalTag, directDetour(addresses[0]))
+		if err != nil {
+			return err
 		}
-		return OutboundDirectFragmentTag
-	})
+		group, members, err := getDNSGroupOptionsFor(DNSServerNamesTag, *first, addresses, DNSLocalTag, false, directDetour)
+		if err != nil {
+			return err
+		}
+		serverMembers = append([]option.DNSServerOptions{*first, *group}, members...)
+	}
+	directGroup, directMembers, err := getDNSGroupOptionsFor(DNSMultiDirectTag, *direct_dns, directAddresses, DNSLocalTag, false, directDetour)
 	if err != nil {
 		return err
 	}
@@ -143,7 +213,7 @@ func setDns(options *option.Options, opt *HiddifyOptions, staticIps *map[string]
 		RawDNSOptions: option.RawDNSOptions{
 			DNSClientOptions: option.DNSClientOptions{
 				IndependentCache: opt.IndependentDNSCache && !C.IsIos,
-				DisableExpire:    true,
+				DisableExpire:    false, // answers expire (HC-38)
 			},
 			Final: DNSMultiRemoteTag,
 
@@ -178,6 +248,7 @@ func setDns(options *option.Options, opt *HiddifyOptions, staticIps *map[string]
 	}
 	dnsOptions.Servers = append(dnsOptions.Servers, remoteMembers...)
 	dnsOptions.Servers = append(dnsOptions.Servers, directMembers...)
+	dnsOptions.Servers = append(dnsOptions.Servers, serverMembers...)
 	options.DNS = &dnsOptions
 
 	// options.DNS.StaticIPs["time.apple.com"] = []string{"time.g.aaplimg.com", "time.apple.com"}
@@ -434,7 +505,11 @@ func tcpFirstOrder(addresses []string) []string {
 // per remaining address of dnsGroupAddresses, in that order, or with every TCP server first, then
 // UDP, then TLS, when [tcpFirst].
 func getDNSGroupOptions(tag string, selected option.DNSServerOptions, selectedAddress, domainResolver string, tcpFirst bool, detour func(address string) string) (*option.DNSServerOptions, []option.DNSServerOptions, error) {
-	addresses := dnsGroupAddresses(selectedAddress)
+	return getDNSGroupOptionsFor(tag, selected, dnsGroupAddresses(selectedAddress), domainResolver, tcpFirst, detour)
+}
+
+// getDNSGroupOptionsFor is getDNSGroupOptions with its addresses, the selected one first.
+func getDNSGroupOptionsFor(tag string, selected option.DNSServerOptions, addresses []string, domainResolver string, tcpFirst bool, detour func(address string) string) (*option.DNSServerOptions, []option.DNSServerOptions, error) {
 	ordered := addresses
 	if tcpFirst {
 		ordered = tcpFirstOrder(addresses)
@@ -671,4 +746,34 @@ func getMultiDnsServerOptions(tag string, servers []string, parallel bool) (*opt
 		},
 	}
 	return &o, nil
+}
+
+// serverDNSAddresses: the resolvers of server-dns-address in order, the system resolver last; none
+// when it is empty.
+func serverDNSAddresses(value string) []string {
+	var addresses []string
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if part != C.DNSTypeLocal {
+			part = getDnsAddress(part)
+		}
+		if !slices.Contains(addresses, part) {
+			addresses = append(addresses, part)
+		}
+	}
+	if len(addresses) > 0 && !slices.Contains(addresses, C.DNSTypeLocal) {
+		addresses = append(addresses, C.DNSTypeLocal)
+	}
+	return addresses
+}
+
+// serverNamesResolver: the DNS server of the VPN servers' names, see HiddifyOptions.ServerDnsAddress.
+func serverNamesResolver(opt *HiddifyOptions) string {
+	if len(serverDNSAddresses(opt.ServerDnsAddress)) > 0 {
+		return DNSServerNamesTag
+	}
+	return DNSMultiDirectTag
 }

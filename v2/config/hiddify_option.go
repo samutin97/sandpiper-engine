@@ -17,12 +17,19 @@ const (
 )
 
 type HiddifyOptions struct {
-	EnableFullConfig        bool   `json:"enable-full-config,omitempty" overridable:"true"`
-	LogLevel                string `json:"log-level,omitempty"`
-	LogFile                 string `json:"log-file,omitempty"`
-	EnableClashApi          bool   `json:"enable-clash-api,omitempty"`
-	ClashApiPort            uint16 `json:"clash-api-port,omitempty"`
-	ClashApiSecret          string `json:"web-secret,omitempty"`
+	EnableFullConfig bool   `json:"enable-full-config,omitempty" overridable:"true"`
+	LogLevel         string `json:"log-level,omitempty"`
+	LogFile          string `json:"log-file,omitempty"`
+	// EnableClashApi: the core's own services (traffic statistics, cache file, monitoring) run;
+	// it no longer opens any port, and the app's value is ignored (hcore.ChangeHiddifySettings
+	// sets it). Only independent instances turn it off.
+	EnableClashApi bool   `json:"enable-clash-api,omitempty"`
+	ClashApiPort   uint16 `json:"clash-api-port,omitempty"`
+	ClashApiSecret string `json:"web-secret,omitempty"`
+	// ClashApiListen opens the Clash API on a loopback TCP port, on the desktop only (never on
+	// Android or iOS), with a random port unless ClashApiPort names another than 16756, and a
+	// random 32-byte secret unless ClashApiSecret is 32 characters or more. Off by default.
+	ClashApiListen          bool   `json:"clash-api-listen,omitempty"`
 	Region                  string `json:"region,omitempty"`
 	BlockAds                bool   `json:"block-ads,omitempty" overridable:"true"`
 	UseXrayCoreWhenPossible bool   `json:"use-xray-core-when-possible,omitempty" overridable:"true"`
@@ -65,6 +72,25 @@ type HiddifyOptions struct {
 	// UseSystemTLSEngine lets a TLS client without a fingerprint use the system's TLS (Apple, Windows) when it
 	// passed its check on this device; else it gets Chrome's uTLS. On unless false.
 	UseSystemTLSEngine *bool `json:"use-system-tls-engine,omitempty"`
+	// ExpandSubscriptionLinks lets the core fetch the subscription URLs a profile lists (https
+	// only, public addresses only). Off by default: they are left out; the app fetches
+	// subscriptions itself, through the VPN.
+	ExpandSubscriptionLinks bool `json:"expand-subscription-links,omitempty"`
+	// TLSFingerprint is the uTLS fingerprint of a TLS client whose profile names none (and that
+	// does not use the system's TLS): "firefox" by default.
+	TLSFingerprint string `json:"tls-fingerprint,omitempty"`
+	// TLSKeyShare is the key share of the uTLS clients that are not REALITY, unless the profile
+	// set one: the fingerprint's own (hybrid) by default, or "classical" (no X25519MLKEM768).
+	TLSKeyShare string `json:"tls-key-share,omitempty"`
+	// HandshakeGate paces the TLS handshakes to one server (on unless false): at most
+	// HandshakeGateMax at a time (3), HandshakeGateGapMs between their starts (450).
+	HandshakeGate      *bool `json:"handshake-gate,omitempty"`
+	HandshakeGateMax   int   `json:"handshake-gate-max,omitempty"`
+	HandshakeGateGapMs int   `json:"handshake-gate-gap-ms,omitempty"`
+	// AllowInsecure keeps the proxies whose TLS checks no certificate (insecure, allowInsecure,
+	// without a pinSHA256 / pcs pin). Off by default: such a proxy is left out of the config, as
+	// anyone on the path can read its password and traffic.
+	AllowInsecure bool `json:"allow-insecure,omitempty"`
 
 	DNSOptions
 	InboundOptions
@@ -78,8 +104,13 @@ type DNSOptions struct {
 	RemoteDnsDomainStrategy option.DomainStrategy `json:"remote-dns-domain-strategy,omitempty" overridable:"true"`
 	DirectDnsAddress        string                `json:"direct-dns-address,omitempty" overridable:"true"`
 	DirectDnsDomainStrategy option.DomainStrategy `json:"direct-dns-domain-strategy,omitempty" overridable:"true"`
-	IndependentDNSCache     bool                  `json:"independent-dns-cache,omitempty"`
-	EnableFakeDNS           bool                  `json:"enable-fake-dns,omitempty"`
+	// ServerDnsAddress: the resolvers of the names of the VPN servers only (the route's default
+	// domain resolver), tried in order, comma-separated, the system resolver last. Empty: the direct
+	// resolver, as before. The app sends DNS over HTTPS by IP address (no plain query before it),
+	// while the direct domains keep direct-dns-address (the system resolver, no third party).
+	ServerDnsAddress    string `json:"server-dns-address,omitempty"`
+	IndependentDNSCache bool   `json:"independent-dns-cache,omitempty"`
+	EnableFakeDNS       bool   `json:"enable-fake-dns,omitempty"`
 	// EnableDNSRouting        bool                  `json:"enable-dns-routing,omitempty"`
 }
 
@@ -107,11 +138,21 @@ type InboundOptions struct {
 	// ProxySecret is the password (of the user "hiddify") of the LAN sharing port, and of the local
 	// port too while LocalProxyAuth is on.
 	ProxySecret string `json:"lan-sharing-password,omitempty"`
-	// LocalProxyAuth makes the local port ask for ProxySecret as well. Off by default: browsers can not
-	// send a SOCKS5 password, nor can a system proxy, which never asks for it.
+	// LocalProxyAuth no longer has any effect (hardened): the local port always asks for a user and
+	// password (LocalProxyUsername, LocalProxyPassword), but for the system proxy's own listener on
+	// the desktop, which can not pass one.
 	LocalProxyAuth bool `json:"local-proxy-auth,omitempty"`
+	// LocalProxyUsername and LocalProxyPassword are the credentials of the local port; with no
+	// password of 16 characters or more, the core makes random ones for the session (see
+	// GetLocalProxyInfo). LocalProxyUsername is also the user of the LAN sharing port ("hiddify"
+	// when unset).
+	LocalProxyUsername string `json:"local-proxy-username,omitempty"`
+	LocalProxyPassword string `json:"local-proxy-password,omitempty"`
+	// LocalProxyUDP allows SOCKS5 UDP ASSOCIATE on the local and LAN ports: off by default, the
+	// password does not cover the UDP relay.
+	LocalProxyUDP bool `json:"local-proxy-udp,omitempty"`
 	// LocalProxyInVpn keeps the local port open in VPN mode, where every app already goes through the
-	// TUN. Off by default.
+	// TUN: on the desktop only, never on Android and iOS. Off by default.
 	LocalProxyInVpn bool   `json:"local-proxy-in-vpn,omitempty"`
 	MTU             uint32 `json:"mtu,omitempty"`
 	StrictRoute     bool   `json:"strict-route,omitempty"`
@@ -134,6 +175,17 @@ type URLTestOptions struct {
 	URLTestInterval    DurationInSeconds `json:"url-test-interval,omitempty" overridable:"true"`
 	// Custom IP geolocation endpoint (subscription `ipinfo-url`); ipapi.co-compatible JSON.
 	IpInfoUrl string `json:"ipinfo-url,omitempty" overridable:"true"`
+	// IpInfo looks the exit's country and address up after each proxy test (through the proxy).
+	// Off by default: every lookup is a request to a geolocation service.
+	IpInfo bool `json:"ipinfo,omitempty"`
+	// MonitoringWorkers is how many proxies are tested at a time: 2 by default, 1 to 4.
+	MonitoringWorkers int `json:"monitoring-workers,omitempty"`
+	// RetestOnNetworkChange: "selected" (default: only the proxies in use), "all" or "none".
+	RetestOnNetworkChange string `json:"retest-on-network-change,omitempty"`
+	// UDPEndpointsInAuto puts the AmneziaWG and WireGuard endpoints in the automatic groups
+	// (lowest, balance) and the regular tests too. Off by default: they are chosen by hand and
+	// tested when selected or asked for.
+	UDPEndpointsInAuto bool `json:"udp-endpoints-in-auto,omitempty"`
 	// URLTestIdleTimeout DurationInSeconds `json:"url-test-idle-timeout"`
 }
 
@@ -143,6 +195,22 @@ type RouteOptions struct {
 	BypassLAN              bool                  `json:"bypass-lan,omitempty"`
 	AllowConnectionFromLAN bool                  `json:"allow-connection-from-lan,omitempty"`
 	BlockQuic              bool                  `json:"block-quic,omitempty"`
+	// TunAddressSeed, made once per installation by the app, gives the TUN addresses of its own
+	// instead of the 172.19.0.1/28 and fdfe:dcba:9876::1/126 every sing-box client has.
+	TunAddressSeed string `json:"tun-address-seed,omitempty"`
+	// RuleSetInitialDir holds the region's rule-sets (geoip-<region>.srs, geosite-<region>.srs) the
+	// app ships, used until the first download through the VPN.
+	RuleSetInitialDir string `json:"rule-set-initial-dir,omitempty"`
+	// PerAppProxyMode is the per-app split tunneling of Android: "include" (only the listed apps
+	// go through the VPN), "exclude" (all but the listed ones), "off" or unset (all apps). The
+	// list goes into the TUN (TunOptions.includePackage / excludePackage), where the app reads it
+	// for VpnService.Builder.
+	PerAppProxyMode string   `json:"per-app-proxy-mode,omitempty"`
+	PerAppProxyList []string `json:"per-app-proxy-list,omitempty"`
+	// PerAppStrict rejects, on Android 10+ in VPN mode, the TUN flows whose owner is unknown (an
+	// app outside the VPN that bound a socket to the TUN, another user or profile, ICMP) and, in
+	// the per-app modes, those of an app on the wrong side of the list. On unless false.
+	PerAppStrict *bool `json:"per-app-strict,omitempty"`
 }
 
 type TLSTricks struct {
@@ -182,7 +250,7 @@ func DefaultHiddifyOptions() *HiddifyOptions {
 		DNSOptions: DNSOptions{
 			RemoteDnsAddress:        "1.1.1.1",
 			RemoteDnsDomainStrategy: option.DomainStrategy(C.DomainStrategyAsIS),
-			DirectDnsAddress:        "1.1.1.1",
+			DirectDnsAddress:        "", // DoH by region, see directDNSAddress
 			DirectDnsDomainStrategy: option.DomainStrategy(C.DomainStrategyAsIS),
 			IndependentDNSCache:     false,
 			EnableFakeDNS:           false,
@@ -203,7 +271,7 @@ func DefaultHiddifyOptions() *HiddifyOptions {
 		},
 		URLTestOptions: URLTestOptions{
 			ConnectionTestUrl: "http://cp.cloudflare.com/",
-			URLTestInterval:   DurationInSeconds(600),
+			URLTestInterval:   DurationInSeconds(defaultURLTestInterval),
 			// URLTestIdleTimeout: DurationInSeconds(6000),
 		},
 		RouteOptions: RouteOptions{

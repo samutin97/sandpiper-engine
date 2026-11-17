@@ -50,6 +50,8 @@ const (
 	Core_EnsureAdminBgService_FullMethodName  = "/hcore.Core/EnsureAdminBgService"
 	Core_ListCrashReports_FullMethodName      = "/hcore.Core/ListCrashReports"
 	Core_ExportDiagnostics_FullMethodName     = "/hcore.Core/ExportDiagnostics"
+	Core_GetLocalProxyInfo_FullMethodName     = "/hcore.Core/GetLocalProxyInfo"
+	Core_DpiProbe_FullMethodName              = "/hcore.Core/DpiProbe"
 )
 
 // CoreClient is the client API for Core service.
@@ -65,7 +67,7 @@ type CoreClient interface {
 	Setup(ctx context.Context, in *SetupRequest, opts ...grpc.CallOption) (*hcommon.Response, error)
 	Parse(ctx context.Context, in *ParseRequest, opts ...grpc.CallOption) (*ParseResponse, error)
 	ChangeHiddifySettings(ctx context.Context, in *ChangeHiddifySettingsRequest, opts ...grpc.CallOption) (*CoreInfoResponse, error)
-	// rpc GenerateConfig (GenerateConfigRequest) returns (GenerateConfigResponse);
+	//rpc GenerateConfig (GenerateConfigRequest) returns (GenerateConfigResponse);
 	StartService(ctx context.Context, in *StartRequest, opts ...grpc.CallOption) (*CoreInfoResponse, error)
 	Stop(ctx context.Context, in *hcommon.Empty, opts ...grpc.CallOption) (*CoreInfoResponse, error)
 	Restart(ctx context.Context, in *StartRequest, opts ...grpc.CallOption) (*CoreInfoResponse, error)
@@ -105,6 +107,11 @@ type CoreClient interface {
 	// path, and its bytes when the request asks for them (a core in another process, whose files the
 	// app cannot read).
 	ExportDiagnostics(ctx context.Context, in *ExportDiagnosticsRequest, opts ...grpc.CallOption) (*ExportDiagnosticsResponse, error)
+	// The local proxy (mixed port) of the current settings: address, user and password; empty when
+	// it does not open (the VPN mode on Android and iOS never opens it). Hardened fork.
+	GetLocalProxyInfo(ctx context.Context, in *hcommon.Empty, opts ...grpc.CallOption) (*LocalProxyInfo, error)
+	// A diagnostic of the path to a server: TCP, TLS, 64 KiB down/up; see DpiProbeRequest. Hardened fork.
+	DpiProbe(ctx context.Context, in *DpiProbeRequest, opts ...grpc.CallOption) (*DpiProbeResponse, error)
 }
 
 type coreClient struct {
@@ -469,6 +476,26 @@ func (c *coreClient) ExportDiagnostics(ctx context.Context, in *ExportDiagnostic
 	return out, nil
 }
 
+func (c *coreClient) GetLocalProxyInfo(ctx context.Context, in *hcommon.Empty, opts ...grpc.CallOption) (*LocalProxyInfo, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LocalProxyInfo)
+	err := c.cc.Invoke(ctx, Core_GetLocalProxyInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coreClient) DpiProbe(ctx context.Context, in *DpiProbeRequest, opts ...grpc.CallOption) (*DpiProbeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DpiProbeResponse)
+	err := c.cc.Invoke(ctx, Core_DpiProbe_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoreServer is the server API for Core service.
 // All implementations must embed UnimplementedCoreServer
 // for forward compatibility.
@@ -482,7 +509,7 @@ type CoreServer interface {
 	Setup(context.Context, *SetupRequest) (*hcommon.Response, error)
 	Parse(context.Context, *ParseRequest) (*ParseResponse, error)
 	ChangeHiddifySettings(context.Context, *ChangeHiddifySettingsRequest) (*CoreInfoResponse, error)
-	// rpc GenerateConfig (GenerateConfigRequest) returns (GenerateConfigResponse);
+	//rpc GenerateConfig (GenerateConfigRequest) returns (GenerateConfigResponse);
 	StartService(context.Context, *StartRequest) (*CoreInfoResponse, error)
 	Stop(context.Context, *hcommon.Empty) (*CoreInfoResponse, error)
 	Restart(context.Context, *StartRequest) (*CoreInfoResponse, error)
@@ -522,6 +549,11 @@ type CoreServer interface {
 	// path, and its bytes when the request asks for them (a core in another process, whose files the
 	// app cannot read).
 	ExportDiagnostics(context.Context, *ExportDiagnosticsRequest) (*ExportDiagnosticsResponse, error)
+	// The local proxy (mixed port) of the current settings: address, user and password; empty when
+	// it does not open (the VPN mode on Android and iOS never opens it). Hardened fork.
+	GetLocalProxyInfo(context.Context, *hcommon.Empty) (*LocalProxyInfo, error)
+	// A diagnostic of the path to a server: TCP, TLS, 64 KiB down/up; see DpiProbeRequest. Hardened fork.
+	DpiProbe(context.Context, *DpiProbeRequest) (*DpiProbeResponse, error)
 	mustEmbedUnimplementedCoreServer()
 }
 
@@ -621,6 +653,12 @@ func (UnimplementedCoreServer) ListCrashReports(context.Context, *hcommon.Empty)
 }
 func (UnimplementedCoreServer) ExportDiagnostics(context.Context, *ExportDiagnosticsRequest) (*ExportDiagnosticsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ExportDiagnostics not implemented")
+}
+func (UnimplementedCoreServer) GetLocalProxyInfo(context.Context, *hcommon.Empty) (*LocalProxyInfo, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLocalProxyInfo not implemented")
+}
+func (UnimplementedCoreServer) DpiProbe(context.Context, *DpiProbeRequest) (*DpiProbeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DpiProbe not implemented")
 }
 func (UnimplementedCoreServer) mustEmbedUnimplementedCoreServer() {}
 func (UnimplementedCoreServer) testEmbeddedByValue()              {}
@@ -1141,6 +1179,42 @@ func _Core_ExportDiagnostics_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Core_GetLocalProxyInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(hcommon.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoreServer).GetLocalProxyInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Core_GetLocalProxyInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoreServer).GetLocalProxyInfo(ctx, req.(*hcommon.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Core_DpiProbe_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DpiProbeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoreServer).DpiProbe(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Core_DpiProbe_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoreServer).DpiProbe(ctx, req.(*DpiProbeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Core_ServiceDesc is the grpc.ServiceDesc for Core service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1243,6 +1317,14 @@ var Core_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ExportDiagnostics",
 			Handler:    _Core_ExportDiagnostics_Handler,
+		},
+		{
+			MethodName: "GetLocalProxyInfo",
+			Handler:    _Core_GetLocalProxyInfo_Handler,
+		},
+		{
+			MethodName: "DpiProbe",
+			Handler:    _Core_DpiProbe_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

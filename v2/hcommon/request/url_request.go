@@ -27,7 +27,10 @@ type Request struct {
 	Method    Method
 	Url       string
 	SocksPort uint16
-	Timeout   time.Duration
+	// SocksUser and SocksPassword: the local proxy always asks for them (hardened fork)
+	SocksUser     string
+	SocksPassword string
+	Timeout       time.Duration
 }
 
 func Send(req Request) (*Response, error) {
@@ -45,7 +48,11 @@ func Send(req Request) (*Response, error) {
 
 	var transport *http.Transport
 	if req.SocksPort > 0 {
-		dialer, err := proxy.SOCKS5("tcp", fmt.Sprintf("127.0.0.1:%d", req.SocksPort), nil, proxy.Direct)
+		var socksAuth *proxy.Auth
+		if req.SocksUser != "" || req.SocksPassword != "" {
+			socksAuth = &proxy.Auth{User: req.SocksUser, Password: req.SocksPassword}
+		}
+		dialer, err := proxy.SOCKS5("tcp", fmt.Sprintf("127.0.0.1:%d", req.SocksPort), socksAuth, proxy.Direct)
 		if err != nil {
 			return nil, err
 		}

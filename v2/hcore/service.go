@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/experimental/clashapi"
 	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
 	"github.com/sagernet/sing-box/experimental/libbox"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
@@ -24,6 +25,10 @@ import (
 func NewService(ctx context.Context, options option.Options, stop <-chan struct{}) (*daemon.StartedService, error) {
 
 	// ctx = filemanager.WithDefault(ctx, sWorkingPath, sTempPath, sUserID, sGroupID)
+	// features that start programs or write the system come from no config here (HC-03)
+	ctx = service.ContextWith[adapter.SecurityPolicy](ctx, denySecurityPolicy{})
+	// box.log rotated, 0600, its lines scrubbed (log_file.go)
+	ctx = service.ContextWith[log.FileOpener](ctx, boxLogOpener{})
 	logInterface := LogInterface{}
 	bopts := daemon.ServiceOptions{
 		Context:     ctx,
@@ -100,6 +105,10 @@ func closeService(ss *daemon.StartedService) error {
 	// a close that takes long is the thing to look at: show what every goroutine is waiting for
 	slow := time.AfterFunc(3*time.Second, func() {
 		path := fmt.Sprint(sWorkingPath, "/data/goroutine-stop-slow.log")
+		if !goroutineSnapshotsOn(static.debug) {
+			reportTiming("stop/service: closing takes more than 3s")
+			return
+		}
 		reportTiming("stop/service: closing takes more than 3s, goroutines dumped to " + path)
 		dumpGoroutinesToFile(path)
 	})

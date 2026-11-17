@@ -65,7 +65,28 @@ var crashMarker = regexp.MustCompile(`(?m)^(panic: |fatal error: |runtime: |SIG[
 // its goroutines are written to goroutineSnapshotPath every goroutineSnapshotInterval, and the
 // next Setup keeps the previous run's file aside as goroutinePreviousPath for the zip. A Go
 // panic also has every goroutine in its crash report (debug.SetTraceback("all")).
+//
+// Only in debug (the app's debug flag at Setup) or a debug build of the core (with_debug_files):
+// a release wrote them every minute, 16-28 KB of the core's internals on the phone's disk, mode
+// 0644 (D-10 of the emulator report). A release removes the ones an earlier core left.
 const goroutineSnapshotInterval = time.Minute
+
+// goroutineSnapshotsOn says whether the goroutines are written to files: the snapshots, and the
+// dumps at a start, a failed or a slow stop.
+func goroutineSnapshotsOn(debug bool) bool {
+	return debug || goroutineSnapshotsBuild
+}
+
+// removeGoroutineSnapshots deletes the snapshots and dumps of an earlier core, in a run that
+// writes none.
+func removeGoroutineSnapshots(workingPath string, mode SetupMode) {
+	for _, path := range []string{goroutineSnapshotPath(workingPath, mode), goroutinePreviousPath(workingPath, mode)} {
+		os.Remove(path)
+	}
+	for _, name := range []string{"goroutine-start.log", "goroutine-stop.log", "goroutine-stop-slow.log"} {
+		os.Remove(filepath.Join(workingPath, "data", name))
+	}
+}
 
 func goroutineSnapshotPath(workingPath string, mode SetupMode) string {
 	return filepath.Join(workingPath, "data", fmt.Sprintf("goroutines-%s.txt", strings.ToLower(mode.String())))
@@ -99,9 +120,15 @@ func writeGoroutineSnapshots(ctx context.Context, workingPath string, mode Setup
 		if !slices.Contains(running, static.CoreState) {
 			continue
 		}
-		os.MkdirAll(filepath.Join(workingPath, "data"), 0o755)
-		os.WriteFile(goroutineSnapshotPath(workingPath, mode), []byte(time.Now().UTC().Format(time.RFC3339)+"\n\n"+goroutineDump()), 0o644)
+		os.MkdirAll(filepath.Join(workingPath, "data"), 0o700)
+		writeGoroutineSnapshot(goroutineSnapshotPath(workingPath, mode))
 	}
+}
+
+// writeGoroutineSnapshot writes the snapshot, readable by the core's user alone.
+func writeGoroutineSnapshot(path string) {
+	os.WriteFile(path, []byte(time.Now().UTC().Format(time.RFC3339)+"\n\n"+goroutineDump()), 0o600)
+	os.Chmod(path, 0o600) // WriteFile keeps the mode of a file an older core wrote 0644
 }
 
 // goroutineDump is the goroutine profile as text: each distinct stack once, with the number of
@@ -369,14 +396,15 @@ func exportDiagnostics(workingPath, tempPath string, req *ExportDiagnosticsReque
 // reportNumberFile keeps the number of the last report, in the working directory.
 const reportNumberFile = "diagnostics-number"
 
-// reportName names the zip the user saves and sends: hiddify-001.zip, numbered across reports so
+// reportName names the zip the user saves and sends: report-001.zip, numbered across reports so
 // they are told apart in Downloads and in a chat. The unencrypted copy of a report keeps that
-// report's number; a zip read back inline is never seen and takes none.
+// report's number; a zip read back inline is never seen and takes none. A neutral name: the
+// app's cache held hiddify-001.zip, which names the VPN client to whoever sees the file (D-12).
 func reportName(workingPath, stamp string, inline, copyOfLast bool) string {
 	if inline {
-		return "hiddify-" + stamp + ".zip"
+		return "report-" + stamp + ".zip"
 	}
-	name := fmt.Sprintf("hiddify-%03d", reportNumber(workingPath, !copyOfLast))
+	name := fmt.Sprintf("report-%03d", reportNumber(workingPath, !copyOfLast))
 	if copyOfLast {
 		name += "-unencrypted"
 	}

@@ -17,9 +17,19 @@ CRONET_GO_VERSION := $(shell cat hiddify-sing-box/.github/CRONET_GO_VERSION)
 # reads them with `make -s print-<VAR>`). Only add platform-specific tags in the *_ADD_TAGS vars.
 CORE_TAGS=with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc,with_awg,tfogo_checklinkname0,with_conntrack
 PROTOCOL_TAGS=with_embedded_tor,with_openvpn,with_openconnect,with_masque,with_kcp,with_sudoku,with_bond,with_call,with_xdrive
+# Hardened fork: `make LEAN=1 <target>` builds only what a VLESS/XHTTP/gRPC/HTTPUpgrade/WS/REALITY,
+# Hysteria2, Naive, TUIC, AmneziaWG, WireGuard, SSH and WARP (MASQUE) user needs: no Tor (it runs a
+# program), OpenConnect (wrapper scripts), OpenVPN, KCP, Sudoku, Bond, Call (pion/webrtc), XDrive,
+# nor the v2ray API service. A profile with one of those protocols then fails to start.
+ifeq ($(LEAN),1)
+PROTOCOL_TAGS=with_masque
+endif
 # Services in every build too. Left out on purpose: with_acme, with_cloudflared, with_tailcat,
 # with_usbip, with_tailscale, with_ccm and with_ocm.
 SERVICE_TAGS=with_v2ray_api
+ifeq ($(LEAN),1)
+SERVICE_TAGS=
+endif
 # Naive (cronet) is part of every build unless disabled explicitly: `make NAIVE=0 <target>`
 # (targets with no cronet library, e.g. CLI for mips/s390x and purego variants).
 NAIVE ?= 1
@@ -112,15 +122,15 @@ protos:
 
 
 lib_install: prepare
-	go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.11
-	go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.11
+	go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
+	go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.12
 	npm install
 
 headers:
 	go build -buildmode=c-archive -o $(BINDIR)/ ./platform/desktop2
 
 android: lib_install
-	CGO_LDFLAGS="-O2 -g -s -w -Wl,-z,max-page-size=16384" gomobile bind -v -androidapi=21 -javapkg=com.hiddify.core -libname=hiddify-core -tags=$(TAGS) -trimpath -ldflags="$(LDFLAGS)" -target=android -gcflags "all=-N -l" -o $(BINDIR)/$(LIBNAME).aar github.com/sagernet/sing-box/experimental/libbox ./platform/mobile
+	CGO_LDFLAGS="-O2 -g -s -w -Wl,-z,max-page-size=16384" gomobile bind -v -androidapi=21 -javapkg=com.hiddify.core -libname=hiddify-core -tags=$(TAGS) -trimpath -ldflags="$(LDFLAGS)" -target=android -o $(BINDIR)/$(LIBNAME).aar github.com/sagernet/sing-box/experimental/libbox ./platform/mobile
 
 ios-full: lib_install
 	gomobile bind -v  -target ios,iossimulator,tvos,tvossimulator,macos -libname=hiddify-core -tags=$(TAGS),$(IOS_ADD_TAGS) -trimpath -ldflags="$(LDFLAGS)" -o $(BINDIR)/$(PRODUCT_NAME).xcframework github.com/sagernet/sing-box/experimental/libbox ./platform/mobile 
@@ -316,8 +326,12 @@ macos-lite: prepare
 	cp $(BINDIR)/$(LIBNAME).dylib ./$(LIBNAME).dylib
 
 
-prepare: 
-	go mod tidy
+prepare:
+	# hardened: no tidy (it rewrites go.mod at build time); go.mod and go.sum must be complete as
+	# committed, and every module the build downloads is checked against go.sum by the go command.
+	# Not `go mod verify`: with Go 1.27 it fails on masterdnsvpn-go, a module path without a dot that
+	# is replaced by a local directory ("missing ziphash"), even with an empty module cache.
+	go list -mod=readonly -m all > /dev/null
 
 # Print a Makefile variable, e.g. `make -s print-CLI_TAGS` (used by CI).
 print-%:

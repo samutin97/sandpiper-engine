@@ -44,8 +44,10 @@ func NewEzytelService(cacheDir string) *EzytelService {
 		cacheDir: cacheDir,
 		client: &http.Client{
 			Timeout: 35 * time.Second,
+			// the certificate is checked (it was not: anyone on the path could change the channels'
+			// content and links, HC-20)
 			Transport: &http.Transport{
-				TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+				TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 				ResponseHeaderTimeout: 30 * time.Second,
 			},
 		},

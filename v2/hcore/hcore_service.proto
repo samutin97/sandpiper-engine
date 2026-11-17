@@ -56,6 +56,11 @@ service Core {
   // path, and its bytes when the request asks for them (a core in another process, whose files the
   // app cannot read).
   rpc ExportDiagnostics (ExportDiagnosticsRequest) returns (ExportDiagnosticsResponse);
+  // The local proxy (mixed port) of the current settings: address, user and password; empty when
+  // it does not open (the VPN mode on Android and iOS never opens it). Hardened fork.
+  rpc GetLocalProxyInfo (hcommon.Empty) returns (LocalProxyInfo);
+  // A diagnostic of the path to a server: TCP, TLS, 64 KiB down/up; see DpiProbeRequest. Hardened fork.
+  rpc DpiProbe (DpiProbeRequest) returns (DpiProbeResponse);
 }
 
 

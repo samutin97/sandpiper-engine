@@ -39,7 +39,7 @@ var hostHasIPv4 = func() bool {
 				continue
 			}
 			ip := prefix.Addr().Unmap()
-			if ip.Is4() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !tunIPv4Network.Contains(ip) {
+			if ip.Is4() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !isTunIPv4(ip) {
 				return true
 			}
 		}

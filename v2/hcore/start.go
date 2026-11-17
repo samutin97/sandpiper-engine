@@ -199,13 +199,7 @@ func startServiceLocked(ctx context.Context, in *StartRequest) (coreResponse *Co
 	Log(LogLevel_DEBUG, LogType_CORE, "Saving config to ", currentBuildConfigPath)
 
 	config.SaveCurrentConfig(ctx, currentBuildConfigPath, *options)
-	if static.debug {
-		pout, err := options.MarshalJSONContext(ctx)
-		if err != nil {
-			return errorWrapper(MessageType_ERROR_BUILDING_CONFIG, err)
-		}
-		Log(LogLevel_INFO, LogType_CORE, "Current Config is:\n", string(pout))
-	}
+	// the config is not written to the log at any level: it holds every key of the profile (HC-15)
 	watch.step("saving the config")
 	ctx = libbox.FromContext(ctx, static.globalPlatformInterface)
 	if static.globalPlatformInterface != nil {

@@ -127,7 +127,8 @@ func TestKeepTopMakesClientEndpointsLazy(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidates := LazyProxyTags(input)
-	if want := []string{"a", "b", "wg", "ovpn", "warp"}; !slices.Equal(candidates, want) {
+	// hardened: WireGuard and AmneziaWG are tested when selected, not by keep top
+	if want := []string{"a", "b", "ovpn", "warp"}; !slices.Equal(candidates, want) {
 		t.Fatalf("candidates = %v, want %v", candidates, want)
 	}
 	opts := chainTestOptions(t, `{"chain-status":"off","keep-top":1}`)
@@ -135,8 +136,8 @@ func TestKeepTopMakesClientEndpointsLazy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if managed := ApplyKeepTop(options, opts, candidates); managed != 5 {
-		t.Fatalf("managed %d, want 5", managed)
+	if managed := ApplyKeepTop(options, opts, candidates); managed != 4 {
+		t.Fatalf("managed %d, want 4", managed)
 	}
 	lazy := map[string]bool{}
 	for _, end := range options.Endpoints {
@@ -147,7 +148,7 @@ func TestKeepTopMakesClientEndpointsLazy(t *testing.T) {
 			lazy[out.Tag] = true
 		}
 	}
-	want := map[string]bool{"a": true, "b": true, "wg": true, "ovpn": true, "warp": true, "wg-server": false}
+	want := map[string]bool{"a": true, "b": true, "wg": false, "ovpn": true, "warp": true, "wg-server": false}
 	for tag, wantLazy := range want {
 		if got, found := lazy[tag]; (found || wantLazy) && got != wantLazy {
 			t.Errorf("%s lazy = %v, want %v", tag, got, wantLazy)
@@ -218,13 +219,13 @@ func TestKeepTopNeverMakesChainHopsLazy(t *testing.T) {
 func TestKeepTopOffWhenTheProfileHasNoMoreProxiesThanItKeeps(t *testing.T) {
 	for _, tc := range []struct {
 		keepTop, managed int
-	}{{5, 0}, {6, 0}, {100, 0}, {4, 5}} {
+	}{{5, 0}, {6, 0}, {100, 0}, {4, 0}, {3, 4}} { // hardened: 4 candidates, wg is not one
 		ctx := libbox.BaseContext(nil)
 		input, err := ReadSingOptions(ctx, &ReadOptions{Content: keepTopEndpointsProfile})
 		if err != nil {
 			t.Fatal(err)
 		}
-		candidates := LazyProxyTags(input) // 5
+		candidates := LazyProxyTags(input) // 4 (hardened: not wg)
 		opts := chainTestOptions(t, fmt.Sprintf(`{"chain-status":"off","keep-top":%d}`, tc.keepTop))
 		options, err := BuildConfig(ctx, opts, &ReadOptions{Options: input})
 		if err != nil {

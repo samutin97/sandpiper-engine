@@ -1,17 +1,37 @@
 package hutils
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
 	"net"
 	"os"
+	"strings"
 	"time"
 )
+
+// CertificateIsNeutral reports whether the PEM certificate names no organization or product
+// (the old ones said "Hiddify, Inc."), and has not expired: else a new one is made.
+func CertificateIsNeutral(certPEM []byte) bool {
+	block, _ := pem.Decode(certPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return false
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	if len(cert.Subject.Organization) > 0 || strings.Contains(strings.ToLower(cert.Subject.String()+cert.Issuer.String()), "hiddify") {
+		return false
+	}
+	return time.Now().Before(cert.NotAfter.Add(-24 * time.Hour))
+}
 
 // CertificatePair holds the certificate and private key
 type CertificatePair struct {
@@ -21,8 +41,13 @@ type CertificatePair struct {
 
 // GenerateCertificatePair generates a self-signed certificate and private key
 // trusted for local gRPC (127.0.0.1 / localhost).
+//
+// It names nobody: a random common name, no organization (it used to say "Hiddify, Inc.", which
+// any app connecting to the loopback port read in the handshake, before any client certificate
+// was asked for: HC-05), an ECDSA P-256 key and one year of validity. The SANs stay, the app's
+// clients check the name 127.0.0.1 / localhost.
 func GenerateCertificatePair() (*CertificatePair, error) {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate private key: %v", err)
 	}
@@ -31,17 +56,20 @@ func GenerateCertificatePair() (*CertificatePair, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate serial: %v", err)
 	}
+	name := make([]byte, 8)
+	if _, err := rand.Read(name); err != nil {
+		return nil, fmt.Errorf("failed to generate name: %v", err)
+	}
 
 	certTemplate := x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
-			Organization: []string{"Hiddify, Inc."},
-			CommonName:   "127.0.0.1",
+			CommonName: hex.EncodeToString(name),
 		},
 		NotBefore: time.Now().Add(-1 * time.Hour),
-		NotAfter:  time.Now().Add(10 * 365 * 24 * time.Hour),
+		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
 
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
@@ -53,9 +81,13 @@ func GenerateCertificatePair() (*CertificatePair, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create certificate: %v", err)
 	}
+	keyBytes, err := x509.MarshalECPrivateKey(privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode private key: %v", err)
+	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
 
 	return &CertificatePair{
 		Certificate: certPEM,

@@ -3,26 +3,18 @@ package config
 import (
 	context "context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"runtime/debug"
 	"time"
 
 	"github.com/sagernet/sing-box/option"
 )
 
+// SaveCurrentConfig writes the running config to path, for debugging: only in a core built with
+// the tag with_debug_files, sanitized, 0600 (debug_files.go). A release core never writes it: the
+// file held every key and password of the profile, in the app's external storage on Android
+// (HC-06).
 func SaveCurrentConfig(ctx context.Context, path string, options option.Options) error {
-	json, err := options.MarshalJSONContext(ctx)
-	if err != nil {
-		return err
-	}
-	p, err := filepath.Abs(path)
-	os.MkdirAll(filepath.Dir(p), 0o755)
-	fmt.Printf("Saving config to %v %+v\n", p, err)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(p, []byte(json), 0o644)
+	return saveCurrentConfig(ctx, path, options)
 }
 
 func DeferPanicToError(name string, err func(error)) {

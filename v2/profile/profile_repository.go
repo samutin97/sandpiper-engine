@@ -266,6 +266,7 @@ func downloadProfileContent(ctx context.Context, url string) (*request.Response,
 				Method:    request.GET,
 				Timeout:   5 * time.Second,
 				SocksPort: instance.ListenPort,
+				SocksUser: instance.ProxyAuth.User, SocksPassword: instance.ProxyAuth.Password,
 			})
 			if err1 != nil {
 				err = fmt.Errorf("%v, Fragment: %v", err, err1)

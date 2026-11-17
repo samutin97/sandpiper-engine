@@ -10,14 +10,9 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"net/http"
-
 	"net"
-	_ "net/http/pprof"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	sync "sync"
 	"time"
 
@@ -44,10 +39,13 @@ func Setup(params *SetupRequest, platformInterface libbox.PlatformInterface) err
 		Log(LogLevel_FATAL, LogType_CORE, err.Error())
 		<-time.After(5 * time.Second)
 	})
-	if params.Debug {
-		go func() {
-			http.ListenAndServe("localhost:6060", nil)
-		}()
+	// pprof only in a debug build of the core (build tag with_pprof), never from the app's
+	// settings or log level: its heap dump holds every key of the running config (HC-07).
+	startDebugPprof(params.Debug)
+	// a control API without authentication is refused before anything starts (HC-08)
+	if err := checkGrpcMode(params.Mode, params.Secret); err != nil {
+		Log(LogLevel_ERROR, LogType_CORE, err.Error())
+		return err
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -59,10 +57,13 @@ func Setup(params *SetupRequest, platformInterface libbox.PlatformInterface) err
 	static.debug = params.Debug
 	static.globalPlatformInterface = platformInterface
 	tcpConn := true // runtime.GOOS == "windows" // TODO add TVOS
+	// The core's own data (settings database, cache file, logs, crash reports) goes to a private
+	// directory: on Android the app's working directory is the external storage (HC-06).
+	dataRoot := prepareDataRoot(params)
 	libbox.Setup(
 		&libbox.SetupOptions{
 			BasePath:    params.BasePath,
-			WorkingPath: params.WorkingDir,
+			WorkingPath: dataRoot,
 			TempPath:    params.TempDir,
 			// IsTVOS:          !tcpConn,
 			FixAndroidStack: params.FixAndroidStack,
@@ -71,18 +72,22 @@ func Setup(params *SetupRequest, platformInterface libbox.PlatformInterface) err
 			OomMemoryLimit:  deviceMemoryLimit,
 		})
 
-	hutils.RedirectStderr(fmt.Sprint(params.WorkingDir, "/data/stderr", params.Mode, ".log"))
+	hutils.RedirectStderr(fmt.Sprint(dataRoot, "/data/stderr", params.Mode, ".log"))
 
-	Log(LogLevel_DEBUG, LogType_CORE, fmt.Sprintf("libbox.Setup success %s %s %s %v", params.BasePath, params.WorkingDir, params.TempDir, tcpConn))
+	Log(LogLevel_DEBUG, LogType_CORE, fmt.Sprintf("libbox.Setup success %s %s %s %s %v", params.BasePath, params.WorkingDir, dataRoot, params.TempDir, tcpConn))
 	if deviceMemoryLimit > 0 || deviceLowMemory {
 		Log(LogLevel_DEBUG, LogType_CORE, fmt.Sprintf("device memory limit %d MB, low memory %v", deviceMemoryLimit>>20, deviceLowMemory))
 	}
 
-	sWorkingPath = params.WorkingDir
+	sWorkingPath = dataRoot
 	sSetupMode = params.Mode
 	cleanupLeftovers()
-	keepPreviousGoroutineSnapshot(sWorkingPath, sSetupMode)
-	go writeGoroutineSnapshots(static.BaseContext, sWorkingPath, sSetupMode)
+	if goroutineSnapshotsOn(params.Debug) {
+		keepPreviousGoroutineSnapshot(sWorkingPath, sSetupMode)
+		go writeGoroutineSnapshots(static.BaseContext, sWorkingPath, sSetupMode)
+	} else {
+		removeGoroutineSnapshots(sWorkingPath, sSetupMode)
+	}
 	os.Chdir(sWorkingPath)
 	sTempPath = params.TempDir
 	sUserID = os.Getuid()
@@ -115,7 +120,7 @@ func Setup(params *SetupRequest, platformInterface libbox.PlatformInterface) err
 		statusPropagationPort = int64(params.FlutterStatusPort)
 	// case SetupMode_GRPC_BACKGROUND_INSECURE:
 	default:
-		_, err := StartGrpcServerByMode(params.Listen, params.Mode)
+		_, err := startGrpcServer(params.Listen, params.Mode, params.Secret)
 		if err != nil {
 			return err
 		}
@@ -128,7 +133,7 @@ func Setup(params *SetupRequest, platformInterface libbox.PlatformInterface) err
 	}
 	settings := db.GetTable[hcommon.AppSettings]()
 	val, err := settings.Get("HiddifySettingsJson")
-	Log(LogLevel_DEBUG, LogType_CORE, "HiddifySettingsJson", val, err)
+	Log(LogLevel_DEBUG, LogType_CORE, "HiddifySettingsJson stored: ", val != nil, " ", err) // not the settings: passwords, WARP keys
 	if val == nil || err != nil {
 		// if params.Mode == SetupMode_GRPC_BACKGROUND_INSECURE {
 		_, err := ChangeHiddifySettings(&ChangeHiddifySettingsRequest{HiddifySettingsJson: ""}, false)
@@ -184,35 +189,41 @@ func StartHelloGrpcServer(listenAddressG string) (*grpc.Server, error) {
 }
 
 var (
-	certpair   *hutils.CertificatePair
-	grpcServer map[SetupMode]*grpc.Server = make(map[SetupMode]*grpc.Server)
-	caCertPool                            = x509.NewCertPool()
-	mu                                    = sync.Mutex{}
+	certpair          *hutils.CertificatePair
+	grpcServer        map[SetupMode]*grpc.Server = make(map[SetupMode]*grpc.Server)
+	grpcListenAddress                            = map[SetupMode]string{}
+	caCertPool                                   = x509.NewCertPool()
+	mu                                           = sync.Mutex{}
 )
 
-// StartGrpcServerByMode starts a gRPC server on the specified address with mTLS.
+// StartGrpcServerByMode starts a gRPC server on the specified address with mTLS. An insecure
+// mode is refused here: it needs a secret (startGrpcServer).
 func StartGrpcServerByMode(listenAddressG string, mode SetupMode) (*grpc.Server, error) {
-	// Validate the listen address
-	if !strings.Contains(listenAddressG, ":") {
-		return nil, fmt.Errorf("invalid listen address (no port): %s", listenAddressG)
+	return startGrpcServer(listenAddressG, mode, "")
+}
+
+// startGrpcServer starts the control server of mode on listenAddressG: a unix socket
+// ("unix:/path", "unix-abstract:name" or "@name"), whose peer must be this user, or a TCP
+// address (port 0 takes a free port; GetListenAddress tells which). The mTLS modes ask for the
+// client certificate the app made; the insecure ones, which the desktop CLI and the macOS
+// extension use, ask for the secret in every call, and are refused without one and on Android
+// and iOS (HC-05, HC-08).
+func startGrpcServer(listenAddressG string, mode SetupMode, secret string) (*grpc.Server, error) {
+	if err := checkGrpcMode(mode, secret); err != nil {
+		return nil, err
 	}
-	// Convert the port from string to uint16
-	portStr := strings.Split(listenAddressG, ":")[1]
-	port, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert port %s to uint16: %v", portStr, err)
-	}
-	if hutils.IsPortInUse(uint16(port)) {
-		return nil, fmt.Errorf("port %s is already in use", portStr)
-	}
-	// Fetch the server private key and public key from the database
 	if _, exists := grpcServer[mode]; exists {
 		Log(LogLevel_WARNING, LogType_CORE, "grpcServer already started")
 		return grpcServer[mode], nil
 	}
+	lis, err := listenControl(listenAddressG)
+	if err != nil {
+		Log(LogLevel_ERROR, LogType_CORE, fmt.Sprintf("failed to listen on %s: %v\n", listenAddressG, err))
+		return nil, err
+	}
 
-	if mode == SetupMode_GRPC_BACKGROUND_INSECURE || mode == SetupMode_GRPC_NORMAL_INSECURE {
-		grpcServer[mode] = grpc.NewServer()
+	if isInsecureMode(mode) {
+		grpcServer[mode] = grpc.NewServer(secretServerOptions(secret)...)
 	} else {
 		if err := loadServerCertificate(); err != nil {
 			return nil, err
@@ -221,7 +232,7 @@ func StartGrpcServerByMode(listenAddressG string, mode SetupMode) (*grpc.Server,
 		serverCert, err := tls.X509KeyPair(certpair.Certificate, certpair.PrivateKey)
 		if err != nil {
 			Log(LogLevel_DEBUG, LogType_CORE, fmt.Sprintf("failed to load server certificate and key: %v\n", err))
-
+			lis.Close()
 			return nil, err
 		}
 
@@ -241,14 +252,8 @@ func StartGrpcServerByMode(listenAddressG string, mode SetupMode) (*grpc.Server,
 	RegisterCoreServer(grpcServer[mode], &CoreService{})
 	hello.RegisterHelloServer(grpcServer[mode], &hello.HelloService{})
 	ezytel.RegisterEzytelServer(grpcServer[mode], ezytel.NewEzytelService(""))
-	// Listen on the provided address
-	lis, err := net.Listen("tcp", listenAddressG)
-	if err != nil {
-		Log(LogLevel_ERROR, LogType_CORE, fmt.Sprintf("failed to listen on %s: %v\n", listenAddressG, err))
-		return nil, err
-	}
-	Log(LogLevel_DEBUG, LogType_CORE, fmt.Sprintf("grpcServer started on %s\n", listenAddressG))
-	log.Info("Server listening on %s", listenAddressG)
+	grpcListenAddress[mode] = lis.Address
+	Log(LogLevel_DEBUG, LogType_CORE, fmt.Sprintf("grpcServer started on %s\n", lis.Address))
 
 	// Run the server in a goroutine
 	go func() {
@@ -282,7 +287,8 @@ func loadServerCertificate() error {
 	if err == nil && err2 == nil {
 		pub, ok1 := grpcServerPublicKey.Value.([]byte)
 		priv, ok2 := grpcServerPrivateKey.Value.([]byte)
-		if ok1 && ok2 && hutils.CertificateHasLoopbackSAN(pub) {
+		// a certificate naming Hiddify (or expiring) is replaced by a neutral one (HC-05)
+		if ok1 && ok2 && hutils.CertificateHasLoopbackSAN(pub) && hutils.CertificateIsNeutral(pub) {
 			certpair = &hutils.CertificatePair{Certificate: pub, PrivateKey: priv}
 			return nil
 		}
@@ -377,4 +383,14 @@ func CloseGrpcServer(mode SetupMode) {
 		server.Stop()
 		delete(grpcServer, mode)
 	}
+	delete(grpcListenAddress, mode)
+}
+
+// GetListenAddress is the address the control server of mode listens on ("unix:/path",
+// "unix-abstract:name", "127.0.0.1:41234"), or "" when it does not run: what the app connects to
+// after asking for a free TCP port (port 0).
+func GetListenAddress(mode SetupMode) string {
+	mu.Lock()
+	defer mu.Unlock()
+	return grpcListenAddress[mode]
 }

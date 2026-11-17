@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 
 	"github.com/hiddify/ray2sing/ray2sing"
 	"github.com/sagernet/sing-box/experimental/libbox"
@@ -93,7 +94,7 @@ func parseConfigContent(ctx context.Context, content []byte, debug bool, configO
 }
 
 func parseShareLinks(ctx context.Context, content []byte, configOpt *HiddifyOptions) (*option.Options, error) {
-	content = expandSubscriptionLinks(ctx, content)
+	content = expandSubscriptionLinks(ctx, content, configOpt.ExpandSubscriptionLinks)
 	v2ray, err := ray2sing.Ray2SingboxOptions(ctx, string(content), configOpt.UseXrayCoreWhenPossible)
 	if err != nil {
 		return nil, fmt.Errorf("unable to determine config format")
@@ -163,6 +164,11 @@ func parseSingboxContent(ctx context.Context, structured any, configOpt *Hiddify
 		jsonObj["endpoints"] = ray2sing.MoveAmneziaWireGuardFields(endpoints)
 	}
 	numberSingboxDuplicates(endpoints, outbounds)
+	// checked at import, so the stored profile is the cleaned one and the app gets the reason of
+	// a refusal (BuildConfig checks again, for profiles of any parser and stored by older cores)
+	if warnings := SanitizeProfileMap(jsonObj); !hasProfileProxies(jsonObj) {
+		return nil, fmt.Errorf("[SingboxParser] no usable outbound in the profile: %s", strings.Join(warnings, "; "))
+	}
 
 	newContent, err := json.MarshalIndent(jsonObj, "", "  ")
 	if err != nil {

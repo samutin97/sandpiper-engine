@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net/netip"
+	"strings"
 	"testing"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -31,10 +32,10 @@ func mixedInbounds(t *testing.T, settings string) map[string]*option.HTTPMixedIn
 	return mixed
 }
 
-const ports = `"mixed-port":12334,"lan-sharing-port":12338,"redirect-port":12336,"direct-port":12337,"lan-sharing-password":"s3cret"`
+const ports = `"mixed-port":12334,"lan-sharing-port":12338,"redirect-port":12336,"direct-port":12337,"lan-sharing-password":"s3cret-pw"`
 
 func asksTheSecret(opts *option.HTTPMixedInboundOptions) bool {
-	return len(opts.Users) == 1 && opts.Users[0].Username == ProxyUser && opts.Users[0].Password == "s3cret"
+	return len(opts.Users) == 1 && opts.Users[0].Username == ProxyUser && opts.Users[0].Password == "s3cret-pw"
 }
 
 func TestVPNModeOpensNoPort(t *testing.T) {
@@ -46,7 +47,14 @@ func TestVPNModeOpensNoPort(t *testing.T) {
 func TestVPNModeOpensTheLocalPortWhenAsked(t *testing.T) {
 	got := mixedInbounds(t, `{"enable-tun":true,"local-proxy-in-vpn":true,`+ports+`}`)
 	opts := got["127.0.0.1 12334"]
-	if opts == nil || len(opts.Users) != 0 || len(got) != 2 {
+	if C.IsAndroid || C.IsIos {
+		if len(got) != 0 {
+			t.Fatalf("VPN mode on a phone opened %v", got)
+		}
+		return
+	}
+	// hardened: with a random user and password
+	if opts == nil || !asksRandomCredentials(opts) || len(got) != 2 {
 		t.Fatalf("VPN mode, local port asked for: %v", got)
 	}
 }
@@ -62,19 +70,67 @@ func TestSharingOpensItsOwnPortWithTheSecret(t *testing.T) {
 	}
 }
 
-func TestProxyModeLocalPortHasNoPasswordByDefault(t *testing.T) {
+// hardened: the local port always asks for a password, random unless the app gives one
+func TestProxyModeLocalPortAlwaysAsksAPassword(t *testing.T) {
 	got := mixedInbounds(t, `{`+ports+`}`)
 	opts := got["127.0.0.1 12334"]
-	if opts == nil || len(opts.Users) != 0 || opts.SetSystemProxy {
+	if opts == nil || !asksRandomCredentials(opts) || opts.SetSystemProxy {
 		t.Fatalf("proxy mode local port = %+v", got)
+	}
+	if !opts.DisableUDP {
+		t.Fatal("SOCKS5 UDP ASSOCIATE allowed by default")
+	}
+	got = mixedInbounds(t, `{"local-proxy-auth":false,`+ports+`}`)
+	if opts := got["127.0.0.1 12334"]; opts == nil || len(opts.Users) != 1 {
+		t.Fatalf("local-proxy-auth false turned the password off: %+v", opts)
 	}
 }
 
-func TestProxyModeLocalPortAsksTheSecretWhenAsked(t *testing.T) {
-	got := mixedInbounds(t, `{"local-proxy-auth":true,`+ports+`}`)
-	if opts := got["127.0.0.1 12334"]; opts == nil || !asksTheSecret(opts) {
-		t.Fatalf("proxy mode local port with a password = %+v", got)
+func TestProxyModeLocalPortTakesTheAppsCredentials(t *testing.T) {
+	got := mixedInbounds(t, `{"local-proxy-username":"u","local-proxy-password":"0123456789abcdef",`+ports+`}`)
+	opts := got["127.0.0.1 12334"]
+	if opts == nil || len(opts.Users) != 1 || opts.Users[0].Username != "u" || opts.Users[0].Password != "0123456789abcdef" {
+		t.Fatalf("proxy mode local port with the app's password = %+v", opts)
 	}
+	// a short password is replaced by a random one
+	got = mixedInbounds(t, `{"local-proxy-password":"short",`+ports+`}`)
+	if opts := got["127.0.0.1 12334"]; opts == nil || !asksRandomCredentials(opts) {
+		t.Fatalf("short password kept: %+v", opts)
+	}
+}
+
+func TestLANSharingNeedsAPassword(t *testing.T) {
+	for _, secret := range []string{"", "short"} {
+		opts := chainTestOptions(t, `{"enable-tun":true,"allow-connection-from-lan":true,"lan-sharing-port":12338,"lan-sharing-password":"`+secret+`"}`)
+		if _, err := BuildConfig(libbox.BaseContext(nil), opts, &ReadOptions{Content: oneProxyProfile}); err == nil {
+			t.Fatalf("LAN sharing with password %q built", secret)
+		}
+	}
+}
+
+func TestPortZeroTakesAFreePort(t *testing.T) {
+	got := mixedInbounds(t, `{"mixed-port":0,"enable-mixed-port":true}`)
+	if len(got) == 0 {
+		t.Fatal("no local port")
+	}
+	for addr := range got {
+		if strings.HasSuffix(addr, " 0") || strings.HasSuffix(addr, " 12334") {
+			t.Fatalf("port %s", addr)
+		}
+	}
+	info := GetLocalProxyInfo(chainTestOptions(t, `{"mixed-port":0,"enable-mixed-port":true}`))
+	if info.Address == "" || info.Password == "" || info.Username == "" {
+		t.Fatalf("info %+v", info)
+	}
+}
+
+// asksRandomCredentials: one user, a neutral random name, a long random password.
+func asksRandomCredentials(opts *option.HTTPMixedInboundOptions) bool {
+	if len(opts.Users) != 1 {
+		return false
+	}
+	u := opts.Users[0]
+	return len(u.Username) == 8 && u.Username != ProxyUser && len(u.Password) >= 32
 }
 
 func TestSystemProxyNeverAsksThisDevice(t *testing.T) {

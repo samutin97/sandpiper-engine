@@ -1,6 +1,8 @@
 package hcore
 
 import (
+	"golang.org/x/net/proxy"
+
 	"context"
 	"sync"
 	"sync/atomic"
@@ -29,8 +31,10 @@ type HiddifyInstance struct {
 	previousStartRequest      *StartRequest
 	debug                     bool
 	ListenPort                uint16
-	BaseContext               context.Context
-	endPauseTimer             *time.Timer // only for ios
+	// ProxyAuth is the user and password of the local proxy of an independent instance
+	ProxyAuth     *proxy.Auth
+	BaseContext   context.Context
+	endPauseTimer *time.Timer // only for ios
 
 	// read by every log call from any goroutine
 	logLevel atomic.Int32

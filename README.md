@@ -1,3 +1,21 @@
+# sandpiper-engine
+
+The core of [Sandpiper](https://github.com/samutin97/sandpiper): **a modified version of
+[hiddify-core](https://github.com/hiddify/hiddify-core) v5.9.8** (branch `hardened`), under the same license
+([LICENSE.md](LICENSE.md)). All credit for the original goes to the Hiddify team; this fork is non-commercial and is
+not endorsed by them. What it changes, and why: [CHANGES-FORK.md](CHANGES-FORK.md) (in Russian).
+
+The changed submodules are forks of their own: `hiddify-sing-box` →
+[sandpiper-engine-box](https://github.com/samutin97/sandpiper-engine-box), `ray2sing` →
+[sandpiper-engine-links](https://github.com/samutin97/sandpiper-engine-links), and under `hiddify-sing-box/replace/`:
+`amneziawg-go` → [sandpiper-engine-wire](https://github.com/samutin97/sandpiper-engine-wire), `sing` →
+[sandpiper-engine-base](https://github.com/samutin97/sandpiper-engine-base) (see `.gitmodules`). It is built by the
+release workflow of the app repository, from the commit the app pins.
+
+The original README of hiddify-core follows.
+
+---
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/hiddify/hiddify.com/refs/heads/main/docs/assets/hiddify-app-logo.svg" alt="Hiddify Logo" width="128">
 </p>

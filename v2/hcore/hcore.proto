@@ -89,6 +89,9 @@ message SetupRequest {
     bool debug = 7;
     SetupMode mode = 8;
     bool fix_android_stack = 9;
+    // Where the core keeps its own data (settings database, cache file, logs, crash reports):
+    // a private directory of the app. Empty: base_path on Android, working_dir elsewhere.
+    string data_path = 10;
 }
 
 message SystemInfo {
@@ -381,4 +384,48 @@ message EnsureAdminBgServiceEvent {
   EnsureAdminBgServiceProgress progress = 1;
   string message = 2;
   uint32 service_port = 3;
+}
+
+// The local proxy of the current settings (Core.GetLocalProxyInfo).
+message LocalProxyInfo {
+  string address = 1;   // "127.0.0.1:port", empty when the local proxy does not open
+  string username = 2;
+  string password = 3;  // empty for the system proxy's own listener on the desktop
+  bool udp = 4;         // SOCKS5 UDP ASSOCIATE allowed
+}
+
+// A diagnostic of the path to a server (Core.DpiProbe): TCP, then TLS with the profile's
+// ClientHello, then 64 KiB down (and up) on one connection, with the outcome classified. Never run
+// by the core itself; at most 12 connections per call, one call at a time. Hardened fork.
+message DpiProbeRequest {
+  string host = 1;                        // the server: an IP or a domain
+  uint32 port = 2;                        // 443 when 0
+  string server_name = 3;                 // the SNI; host when empty
+  string fingerprint = 4;                 // uTLS fingerprint; firefox when empty
+  string path = 5;                        // a path that answers at least 64 KiB to a GET (a decoy, e.g. /files/64k.bin); "/" when empty
+  bool upload = 6;                        // also send 64 KiB (POST to upload_path, on a connection of its own)
+  uint32 attempts = 7;                    // 1 or 2 (1 when 0)
+  uint32 timeout_ms = 8;                  // per stage, 8000 when 0, at most 30000
+  bool insecure = 9;                      // do not check the certificate (a decoy with its own)
+  repeated string certificate_sha256 = 10; // pins, hex
+  string key_share = 11;                  // "" (the fingerprint's) or "classical"
+  string upload_path = 12;                // where the upload POSTs (a decoy that reads the body, e.g. /upload); path when empty
+}
+
+message DpiProbeStage {
+  string name = 1;     // tcp, tls, download, upload
+  string outcome = 2;  // ok, timeout, reset, error, freeze_16k, stall
+  int64 bytes = 3;     // bytes moved in the stage
+  int64 millis = 4;
+  string detail = 5;   // the error, scrubbed of addresses
+}
+
+message DpiProbeResponse {
+  // ok; tcp_timeout, tcp_reset (no connection); tls_timeout (no ServerHello: the ClientHello cut,
+  // M4), tls_reset, tls_error; freeze_16k (the transfer stopped between 14 and 25 KB without a
+  // reset: the "16 KB" limit, M1); stall, reset (the transfer stopped otherwise); busy (another
+  // probe runs); error (bad request)
+  string outcome = 1;
+  repeated DpiProbeStage stages = 2;
+  uint32 connections = 3;
 }

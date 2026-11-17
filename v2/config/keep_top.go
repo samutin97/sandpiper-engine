@@ -67,6 +67,11 @@ func canBeLazyEndpoint(end *option.Endpoint) bool {
 	if !lazyEndpointTypes[end.Type] {
 		return false
 	}
+	// hardened: an AmneziaWG or plain WireGuard endpoint is not managed by keep top, whose search
+	// tests every candidate: they are tested when selected (see onDemandTypes)
+	if udpEndpointTypes[end.Type] {
+		return false
+	}
 	switch options := end.Options.(type) {
 	case *option.WireGuardEndpointOptions:
 		return options.ListenPort == 0
