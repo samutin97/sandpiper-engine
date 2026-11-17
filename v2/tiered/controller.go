@@ -49,7 +49,7 @@ type Network struct {
 }
 
 // Env is what the controller does in the world: the core gives the real one, tests a scripted one.
-// The controller calls it from one goroutine at a time.
+// The controller calls it from the goroutine that drives it, Log also from the one that calls Agree.
 type Env interface {
 	Now() time.Time
 	// Sleep waits d or until ctx ends (then an error).
@@ -58,8 +58,14 @@ type Env interface {
 	Check(ctx context.Context, tag string) CheckResult
 	// CheckPath checks the path to the server outside the tunnel (TCP, TLS, a transfer).
 	CheckPath(ctx context.Context) PathVerdict
-	// Select makes tag the proxy of the tiered group.
+	// Select makes tag the proxy of the tiered group. A last resort that waits for the user's
+	// agreement is refused, and the group held instead (see Hold): the core keeps that rule too.
 	Select(tag string) error
+	// Hold puts the tiered group on no proxy: its connections are refused. The group waits there while
+	// nothing but a last resort the user has not agreed to is left, never on that last resort.
+	Hold() error
+	// Picked: the tiered group is still the user's pick; a walk stops once it is not.
+	Picked() bool
 	Network() Network
 	Log(message string)
 }
@@ -76,12 +82,14 @@ const (
 	TransportDownTTL = 2 * time.Hour    // TCP to the server confirmed out (frozen or cut) in a network
 	MemoryTTL        = TransportDownTTL // a network is forgotten when its last mark is this old
 	retryChecks      = 3                // checks of the proxies marked down in one walk
-	ConfirmPass     = time.Minute      // between the two checks that bring a proxy above back
-	LastResortRetry = 5 * time.Minute  // on last resort past its max: the way up is checked this often
-	NoneFirst       = time.Minute      // nothing works: the first wait before trying again
-	NoneMax         = 15 * time.Minute // nothing works: the longest wait
-	maxNetworks     = 16
-	upChecksPerTurn = 2 // checks of the proxies above in one turn of the way up
+	walkBudget       = 24               // checks in one walk past which a proxy gets a single try
+	clockSkew        = time.Minute      // a stored time this far ahead of the clock: the clock went back
+	ConfirmPass      = time.Minute      // between the two checks that bring a proxy above back
+	LastResortRetry  = 5 * time.Minute  // on last resort past its max: the way up is checked this often
+	NoneFirst        = time.Minute      // nothing works: the first wait before trying again
+	NoneMax          = 15 * time.Minute // nothing works: the longest wait
+	maxNetworks      = 16
+	upChecksPerTurn  = 2 // checks of the proxies above in one turn of the way up
 )
 
 // Reasons the app shows.
@@ -122,29 +130,34 @@ type netMemory struct {
 	Updated    time.Time            `json:"at"`
 }
 
-// Controller chooses the proxy of the tiered group. Its methods other than State are called from
-// one goroutine (the core's loop, or a test).
+// Controller chooses the proxy of the tiered group. State, NeedsConsent, Agree and Consent are safe
+// from any goroutine; the other methods are called from one (the core's loop, or a test), which
+// owns every field below but the two guarded by a lock.
 type Controller struct {
 	// OnChange, when set, is called after the state changed (to tell the app at once).
 	OnChange func()
-	// OnConsent, when set, is called when the user agreed to a last-resort proxy: the core keeps the
-	// agreement for the rest of its run (a reload makes a new controller, see Consent).
+	// OnConsent, when set, is called when the user agreed to a last-resort proxy, from the goroutine
+	// that called Agree: the core keeps the agreement for the rest of its run with this profile (a
+	// reload makes a new controller, see Consent).
 	OnConsent func(tag string)
 
 	env   Env
-	plan  *Plan
+	plan  *Plan // never changes
 	store Store
 
 	stateMu sync.Mutex
-	state   State
+	state   State // under stateMu
 
-	memory   map[string]*netMemory
-	network  Network
-	enabled  bool
-	active   int // index in plan.Candidates, -1 none
-	since    time.Time
-	slow     bool
-	confirms map[string]bool
+	consentMu sync.Mutex
+	confirms  map[string]bool // the last resorts the user agreed to, under consentMu
+
+	memory  map[string]*netMemory
+	network Network
+	enabled bool
+	active  int // index in plan.Candidates, -1 none
+	since   time.Time
+	slow    bool
+	waiting string // the last resort offered to the user, while the group is held for it
 
 	nextCheck time.Time // the active proxy's data check
 	nextUp    time.Time // the next turn of the way up
@@ -162,8 +175,33 @@ func New(env Env, plan *Plan, store Store) *Controller {
 	return c
 }
 
-// Consent records that the user already agreed to the last-resort proxy tag in this run of the core.
-func (c *Controller) Consent(tag string) { c.confirms[tag] = true }
+// Consent records that the user already agreed to the last-resort proxy tag in this run of the core
+// with this profile (the core's memory of it, given to a new controller).
+func (c *Controller) Consent(tag string) {
+	c.consentMu.Lock()
+	defer c.consentMu.Unlock()
+	c.confirms[tag] = true
+}
+
+// Agree records the user's agreement to the last-resort proxy tag, from any goroutine; false when tag
+// is no last resort that asks for one. It holds whether or not the controller waits for it now: the
+// user agreed to that proxy, and a walk that runs meanwhile takes it into account.
+func (c *Controller) Agree(tag string) bool {
+	if !slices.Contains(c.plan.Reserves(), tag) {
+		return false
+	}
+	c.consentMu.Lock()
+	already := c.confirms[tag]
+	c.confirms[tag] = true
+	c.consentMu.Unlock()
+	if !already {
+		c.logf("the user agreed to %s", tag)
+		if c.OnConsent != nil {
+			c.OnConsent(tag)
+		}
+	}
+	return true
+}
 
 // State is the state for the app; safe from any goroutine.
 func (c *Controller) State() State {
@@ -209,6 +247,9 @@ func (c *Controller) Evaluate(ctx context.Context, why string) {
 	if !c.enabled || len(c.plan.Candidates) == 0 {
 		return
 	}
+	// a new start (another network, the user's pick or agreement): the waits of "nothing works"
+	// start again from the shortest
+	c.noneWait = 0
 	c.network = c.env.Network()
 	if !c.network.Online {
 		c.offline()
@@ -245,19 +286,12 @@ func (c *Controller) ActiveFailed(ctx context.Context) {
 	c.Tick(ctx)
 }
 
-// Confirm: the user agreed to use the last-resort proxy tag.
+// Confirm: the user agreed to use the last-resort proxy tag (Agree), and the controller chooses again
+// at once.
 func (c *Controller) Confirm(ctx context.Context, tag string) bool {
-	if !c.enabled {
+	if !c.Agree(tag) {
 		return false
 	}
-	if c.State().Confirm != tag {
-		return false
-	}
-	c.confirms[tag] = true
-	if c.OnConsent != nil {
-		c.OnConsent(tag)
-	}
-	c.logf("the user agreed to %s", tag)
 	c.Evaluate(ctx, "the user agreed to the last resort")
 	return true
 }
@@ -432,7 +466,12 @@ func (c *Controller) clearUp(to int) {
 // needsConsent: a last resort the user has to agree to first; until then it is not even checked
 // (a check is already a handshake with the server).
 func (c *Controller) needsConsent(cand Candidate) bool {
-	return cand.Mode == ModeLastResort && cand.Confirm && !c.confirms[cand.Tag]
+	if cand.Mode != ModeLastResort || !cand.Confirm {
+		return false
+	}
+	c.consentMu.Lock()
+	defer c.consentMu.Unlock()
+	return !c.confirms[cand.Tag]
 }
 
 // NeedsConsent are the tags of the last-resort proxies still waiting for the user's agreement:
@@ -514,15 +553,40 @@ func (c *Controller) walk(ctx context.Context, retry bool) {
 	}
 	c.active = -1
 	c.scheduleNone()
-	if consent >= 0 {
+	if consent >= 0 && c.needsConsent(c.plan.Candidates[consent]) {
+		// only the last resort is left: the group is held (no connection, never through it) until
+		// the user agrees, or a later try finds a proxy above that works
 		cand := c.plan.Candidates[consent]
-		c.logf("last resort %s waits for the user", cand.Tag)
+		c.waiting = cand.Tag
+		c.hold()
+		c.logf("last resort %s waits for the user: no connection meanwhile", cand.Tag)
 		c.setState(State{Tier: cand.Tier, Mode: cand.Mode, Reason: ReasonConfirm, Confirm: cand.Tag, Down: c.downTags(), Network: c.network.ID})
 		return
 	}
-	// nothing works: the choice stays, and everything is tried again later
+	// nothing works: the choice stays, and everything is tried again later (an agreement given
+	// while this walk ran is taken by the walk it starts)
+	c.waiting = ""
 	c.logf("no proxy of the policy works; again in %s", c.noneWait)
 	c.setState(State{Tier: -1, Reason: ReasonNone, Down: c.downTags(), Network: c.network.ID})
+}
+
+// hold puts the group on no proxy (Env.Hold).
+func (c *Controller) hold() {
+	if err := c.env.Hold(); err != nil {
+		c.logf("hold: %v", err)
+	}
+}
+
+// offered is the last resort still waiting for the user's agreement, kept in the state while later
+// tries run, so the question does not come and go; "" when none.
+func (c *Controller) offered() string {
+	if c.waiting == "" {
+		return ""
+	}
+	if i := c.indexOf(c.waiting); i < 0 || !c.needsConsent(c.plan.Candidates[i]) {
+		return ""
+	}
+	return c.waiting
 }
 
 // markedOrder are the marked candidates this walk did not try, the oldest mark first.
@@ -565,13 +629,24 @@ func (c *Controller) markedAt(cand Candidate) time.Time {
 func (c *Controller) try(ctx context.Context, w *walkState, i int, attempts int) verdict {
 	cand := c.plan.Candidates[i]
 	w.tried[i] = true
-	c.setState(State{Tier: cand.Tier, Mode: cand.Mode, Node: cand.Tag, Reason: ReasonChecking, Checking: true, Down: c.downTags(), Network: c.network.ID})
+	c.setState(State{
+		Tier: cand.Tier, Mode: cand.Mode, Node: cand.Tag, Reason: ReasonChecking, Checking: true, Confirm: c.offered(),
+		Down: c.downTags(), Network: c.network.ID,
+	})
 	v := verdictDown
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
+			if w.checks >= walkBudget {
+				break // a long walk: one try a proxy from here on
+			}
 			if c.env.Sleep(ctx, c.plan.Params.Retry) != nil {
 				return verdictAborted
 			}
+		}
+		if !c.env.Picked() {
+			// the user picked something else meanwhile: the walk stops here
+			c.SetEnabled(ctx, false)
+			return verdictAborted
 		}
 		if c.networkMoved() {
 			c.Evaluate(ctx, "network changed")
@@ -664,6 +739,7 @@ func (c *Controller) confirmFailure(ctx context.Context, cand Candidate, first C
 			return verdictAborted
 		}
 		if r.Outcome.Works() {
+			c.slow = r.Outcome == Slow
 			return verdictWorks
 		}
 	}
@@ -679,6 +755,14 @@ func (c *Controller) networkMoved() bool {
 // use selects candidate i.
 func (c *Controller) use(i int) {
 	cand := c.plan.Candidates[i]
+	if c.needsConsent(cand) {
+		// the walk and the way up leave such a proxy out; the rule holds here as well
+		c.logf("%s waits for the user's agreement: not used", cand.Tag)
+		c.active, c.waiting = -1, cand.Tag
+		c.hold()
+		c.setState(State{Tier: cand.Tier, Mode: cand.Mode, Reason: ReasonConfirm, Confirm: cand.Tag, Down: c.downTags(), Network: c.network.ID})
+		return
+	}
 	if err := c.env.Select(cand.Tag); err != nil {
 		c.logf("select %s: %v", cand.Tag, err)
 	}
@@ -686,6 +770,7 @@ func (c *Controller) use(i int) {
 		c.since = c.env.Now()
 	}
 	c.active = i
+	c.waiting = ""
 	c.noneWait = 0
 	c.upPassed = ""
 	c.upCursor = 0
@@ -758,6 +843,7 @@ func (c *Controller) wayUp(ctx context.Context, limit int) {
 			}
 			c.logf("way up, second check of %s: %s", c.plan.Candidates[i].Tag, r.Outcome)
 			if r.Outcome.Works() {
+				c.slow = r.Outcome == Slow
 				c.clearUp(i)
 				c.use(i)
 				return
@@ -787,6 +873,7 @@ func (c *Controller) wayUp(ctx context.Context, limit int) {
 		}
 		if nothing {
 			// nothing works now: one pass is enough
+			c.slow = r.Outcome == Slow
 			c.clearUp(i)
 			c.use(i)
 			return
@@ -836,8 +923,19 @@ func (c *Controller) loadMemory() {
 	}
 	now := c.env.Now()
 	for id, m := range memory {
-		if m == nil || now.Sub(m.Updated) > MemoryTTL {
+		// a network last marked in the future: the clock went back since, and its marks would last
+		// that much longer; forgotten
+		if m == nil || now.Sub(m.Updated) > MemoryTTL || m.Updated.After(now.Add(clockSkew)) {
 			continue
+		}
+		// and no mark lasts longer than its time from now, whatever the clock did
+		for tag, until := range m.Down {
+			if until.After(now.Add(NodeDownTTL)) {
+				m.Down[tag] = now.Add(NodeDownTTL)
+			}
+		}
+		if m.TCPBlocked.After(now.Add(TransportDownTTL)) {
+			m.TCPBlocked = now.Add(TransportDownTTL)
 		}
 		c.memory[id] = m
 	}

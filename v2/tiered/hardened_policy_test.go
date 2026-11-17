@@ -70,7 +70,7 @@ func TestPolicyRefs(t *testing.T) {
 		ref  Ref
 		want string
 	}{
-		{Ref{Number: 1}, "1 One"},  // not "10 Ten"
+		{Ref{Number: 1}, "1 One"}, // not "10 Ten"
 		{Ref{Number: 10}, "10 Ten"},
 		{Ref{Number: 11}, "11§hide§x"}, // the core's suffix does not count
 		{Ref{Number: 2}, "2. Two"},
@@ -128,40 +128,40 @@ func TestPolicyGarbageIsRefusedWhole(t *testing.T) {
 		"v=2;t=auto:1",
 		"t=auto:1;v=1",
 		"v=1;v=1",
-		"v=1;t=auto:1;t=fallback:1",     // one proxy in two tiers
-		"v=1;t=auto:1,1",                // twice in a tier
-		"v=1;n=1:555;n=1:444",           // scored twice
-		"v=1;n=1:556",                   // score out of 1..5
-		"v=1;n=1:055",                   // score 0
-		"v=1;n=1:55",                    // two scores
-		"v=1;n=1:5555",                  // four
-		"v=1;n=1",                       // no scores
-		"v=1;n=1:555:a+b+c",             // three captions
-		"v=1;n=1:555:Bad",               // caption not lower case
-		"v=1;n=1:555:a b",               // space in a caption
-		"v=1;n=1:555:x:y",               // too many parts
-		"v=1;t=auto:",                   // empty list
-		"v=1;t=auto:0",                  // no proxy 0
-		"v=1;t=auto:1000",               // beyond 999
-		"v=1;t=auto:01",                 // leading zero
-		"v=1;t=fast:1",                  // unknown mode
-		"v=1;t=auto",                    // no list
-		"v=1;t=auto,:1",                 // empty flag
-		"v=1;t=last-resort,max=x:1",     // bad max
-		"v=1;t=auto:@",                  // empty name
-		"v=1;t=auto:@a%2",               // bad escape
-		"v=1;t=auto:@a b",               // space in a name
-		"v=1;t=auto:@a%00b",             // control character
-		"v=1;fail=2;fail=3",             // repeated parameter
-		"v=1;fail=-1",                   // signed
-		"v=1;fail=02",                   // leading zero
-		"v=1;fail=two",                  // not a number
-		"v=1;up=12345678",               // too many digits
-		"v=1;=1",                        // empty key
-		"v=1;garbage",                   // no =
-		"v=1;t=auto:1\x01",              // control byte
-		"v=1;n=1:555:ру",                // not ASCII
-		"v=1;" + strings.Repeat("t=auto:1;", 1) + strings.Repeat("x=1;", 600), // too long
+		"v=1;t=auto:1;t=fallback:1", // one proxy in two tiers
+		"v=1;t=auto:1,1",            // twice in a tier
+		"v=1;n=1:555;n=1:444",       // scored twice
+		"v=1;n=1:556",               // score out of 1..5
+		"v=1;n=1:055",               // score 0
+		"v=1;n=1:55",                // two scores
+		"v=1;n=1:5555",              // four
+		"v=1;n=1",                   // no scores
+		"v=1;n=1:555:a+b+c",         // three captions
+		"v=1;n=1:555:Bad",           // caption not lower case
+		"v=1;n=1:555:a b",           // space in a caption
+		"v=1;n=1:555:x:y",           // too many parts
+		"v=1;t=auto:",               // empty list
+		"v=1;t=auto:0",              // no proxy 0
+		"v=1;t=auto:1000",           // beyond 999
+		"v=1;t=auto:01",             // leading zero
+		"v=1;t=fast:1",              // unknown mode
+		"v=1;t=auto",                // no list
+		"v=1;t=auto,:1",             // empty flag
+		"v=1;t=last-resort,max=x:1", // bad max
+		"v=1;t=auto:@",              // empty name
+		"v=1;t=auto:@a%2",           // bad escape
+		"v=1;t=auto:@a b",           // space in a name
+		"v=1;t=auto:@a%00b",         // control character
+		"v=1;fail=2;fail=3",         // repeated parameter
+		"v=1;fail=-1",               // signed
+		"v=1;fail=02",               // leading zero
+		"v=1;fail=two",              // not a number
+		"v=1;up=12345678",           // too many digits
+		"v=1;=1",                    // empty key
+		"v=1;garbage",               // no =
+		"v=1;t=auto:1\x01",          // control byte
+		"v=1;n=1:555:ру",            // not ASCII
+		"v=1;" + strings.Repeat("t=auto:1;", 1) + strings.Repeat("x=1;", 600),                  // too long
 		"v=1;t=auto:1;t=auto:2;t=auto:3;t=auto:4;t=auto:5;t=auto:6;t=auto:7;t=auto:8;t=auto:9", // nine tiers
 	} {
 		if p, err := Parse(header); err == nil {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -24,8 +25,14 @@ type fakeEnv struct {
 	path       func(now time.Time) (PathVerdict, time.Duration)
 	checks     []string // every proxy checked, in order
 	handshakes int      // TLS or QUIC handshakes with the server: one per check of a proxy or of the path
-	log        []string
+	// picked says whether the tiered group is still the user's pick; nil: always
+	picked func() bool
+	logMu  sync.Mutex
+	log    []string
 }
+
+// held is what selected says while the group is held on no proxy.
+const held = "(held)"
 
 func newFakeEnv(t *testing.T) *fakeEnv {
 	start := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
@@ -62,8 +69,18 @@ func (e *fakeEnv) Select(tag string) error {
 	e.selects = append(e.selects, tag)
 	return nil
 }
+func (e *fakeEnv) Hold() error {
+	e.selected = held
+	e.selects = append(e.selects, held)
+	return nil
+}
+func (e *fakeEnv) Picked() bool     { return e.picked == nil || e.picked() }
 func (e *fakeEnv) Network() Network { return e.network }
-func (e *fakeEnv) Log(m string)     { e.log = append(e.log, m) }
+func (e *fakeEnv) Log(m string) {
+	e.logMu.Lock()
+	defer e.logMu.Unlock()
+	e.log = append(e.log, m)
+}
 func (e *fakeEnv) elapsed() time.Duration {
 	return e.now.Sub(e.start)
 }
@@ -451,7 +468,8 @@ func TestTierNothingWorks(t *testing.T) {
 	if extra := len(env.checks) - checks; extra < 4 || extra > 21 {
 		t.Fatalf("%d checks in an hour of nothing", extra)
 	}
-	if env.selected != "" {
+	// waiting for the user: the group is held, on no proxy
+	if env.selected != held {
 		t.Fatalf("selected %q", env.selected)
 	}
 }

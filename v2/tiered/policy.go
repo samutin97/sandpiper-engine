@@ -232,6 +232,12 @@ func Parse(header string) (*Policy, error) {
 	if first {
 		return nil, garbage("no v=1")
 	}
+	// the canonical form (what the app keeps and gives the core) brings numbers to their bounds, which
+	// can make it a few bytes longer than the header: one over the limit is no policy, here as in the
+	// app, so the two never disagree
+	if n := len(policy.Canonical()); n > maxHeaderLength {
+		return nil, garbage("canonical form of %d bytes", n)
+	}
 	return policy, nil
 }
 
@@ -515,8 +521,29 @@ type Plan struct {
 	Params     Params
 }
 
+// Strictness orders the tiers for a proxy the policy names in several of them (by its number in one
+// and its name in another): the strictest one holds it, so that an alias never lets the controller
+// use by itself a proxy another tier keeps for the user's agreement. Manual is the strictest (never
+// chosen), then a last resort that waits for the user, a last resort, a fallback, auto.
+func Strictness(mode string, confirm bool) int {
+	switch mode {
+	case ModeManual:
+		return 4
+	case ModeLastResort:
+		if confirm {
+			return 3
+		}
+		return 2
+	case ModeFallback:
+		return 1
+	}
+	return 0
+}
+
 // Bind binds the policy to the tags of a profile (its proxies, in their order); udp says whether a
-// proxy carries its traffic over UDP. A reference that names no tag, or several, is skipped.
+// proxy carries its traffic over UDP. A reference that names no tag, or several, is skipped; a proxy
+// named in several tiers (a number and a name of the same proxy) is in the strictest of them (see
+// Strictness), of equal ones the first.
 func (p *Policy) Bind(tags []string, udp func(tag string) bool) *Plan {
 	plan := &Plan{Params: p.Params}
 	if p.Empty() {
@@ -528,12 +555,24 @@ func (p *Policy) Bind(tags []string, udp func(tag string) bool) *Plan {
 			scores[tag] = n
 		}
 	}
+	home := map[string]int{} // tag -> the index of its tier
+	for ti, t := range p.Tiers {
+		for _, ref := range t.Refs {
+			tag := Resolve(ref, tags)
+			if tag == "" {
+				continue
+			}
+			if prev, seen := home[tag]; !seen || Strictness(t.Mode, t.Confirm) > Strictness(p.Tiers[prev].Mode, p.Tiers[prev].Confirm) {
+				home[tag] = ti
+			}
+		}
+	}
 	used := map[string]bool{}
 	for ti, t := range p.Tiers {
 		var tier []Candidate
 		for order, ref := range t.Refs {
 			tag := Resolve(ref, tags)
-			if tag == "" || used[tag] {
+			if tag == "" || used[tag] || home[tag] != ti {
 				continue
 			}
 			used[tag] = true
@@ -566,6 +605,21 @@ func (p *Policy) Bind(tags []string, udp func(tag string) bool) *Plan {
 		}
 	}
 	return plan
+}
+
+// Reserves are the last resorts that wait for the user's agreement: nothing may use or even test
+// them before it (a test is a handshake with the server).
+func (p *Plan) Reserves() []string {
+	if p == nil {
+		return nil
+	}
+	var tags []string
+	for _, c := range p.Candidates {
+		if c.Mode == ModeLastResort && c.Confirm {
+			tags = append(tags, c.Tag)
+		}
+	}
+	return tags
 }
 
 // Tags are the candidates' tags, in order.
