@@ -10,8 +10,7 @@ import "C"
 import (
 	// "os"
 	// "os/signal"
-
-	"runtime"
+	// "runtime"
 
 	// "syscall"
 	"unsafe"
@@ -62,17 +61,19 @@ func cleanup() {
 	// C.cleanup_signals()
 }
 
-func emptyOrErrorC(err error) *C.char {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+// Strings across the C boundary: every *C.char an export of this library returns is allocated
+// here with C.CString (C's malloc) and belongs to the caller from then on. The caller reads it and
+// then hands it back to freeString; nothing here frees it. emptyOrErrorC used to free the error
+// text before returning it, so the app read freed memory: the reason of a failed setup arrived as
+// garbage ("FormatException: Invalid UTF-8 byte"), or not at all (W4-02).
 
+// emptyOrErrorC is "" on success, else the error's text; the caller frees it with freeString.
+func emptyOrErrorC(err error) *C.char {
 	if err == nil {
 		return C.CString("")
 	}
 	log.Error(err.Error())
-	str := C.CString(err.Error())
-	defer C.free(unsafe.Pointer(str))
-	return str
+	return C.CString(err.Error())
 }
 
 //export setup
@@ -98,10 +99,13 @@ func setup(baseDir *C.char, workingDir *C.char, tempDir *C.char, mode C.int, lis
 	return emptyOrErrorC(err)
 }
 
+// freeString frees a string an export of this library returned, once the caller has read it.
+//
 //export freeString
 func freeString(str *C.char) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	if str == nil {
+		return
+	}
 	C.free(unsafe.Pointer(str))
 }
 
@@ -146,7 +150,7 @@ func GetServerPublicKey() *C.char {
 	// defer runtime.UnlockOSThread()
 
 	publicKey := hcore.GetGrpcServerPublicKey()
-	return C.CString(string(publicKey)) // Return as C string, caller must free
+	return C.CString(string(publicKey)) // the caller frees it with freeString
 }
 
 //export AddGrpcClientPublicKey
@@ -167,3 +171,4 @@ func closeGrpc(mode C.int) {
 
 	hcore.Close(hcore.SetupMode(mode))
 }
+
