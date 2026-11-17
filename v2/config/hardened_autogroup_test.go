@@ -170,3 +170,43 @@ func TestAutoGroupTags(t *testing.T) {
 		t.Fatal("one proxy: no automatic groups, nothing on demand")
 	}
 }
+
+// SP3-03: keep top manages only the proxies the monitoring tests in its cycles, the automatic
+// group's: a profile whose group has 3 got "KEEP TOP 6 outbounds have no result after 30s" for the
+// proxies tested on demand only. It manages only the group, and keeping the whole
+// group is no keep top at all.
+func TestKeepTopFollowsTheAutomaticGroup(t *testing.T) {
+	ctx := libbox.BaseContext(nil)
+	for _, c := range []struct {
+		keepTop int
+		managed int
+	}{{3, 4}, {4, 0}, {6, 0}} { // the group has 4: 1-4 (9 is UDP)
+		settings := `{"enable-tun":true,"keep-top":` + strings.TrimSpace(string(rune('0'+c.keepTop))) + `}`
+		hopts := chainTestOptions(t, settings)
+		parsed, err := ParseConfig(ctx, &ReadOptions{Content: panelSubscription}, false, hopts, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidates := LazyProxyTags(parsed)
+		options, err := BuildConfig(ctx, hopts, &ReadOptions{Options: parsed})
+		if err != nil {
+			t.Fatal(err)
+		}
+		onDemand := options.Experimental.Monitoring.OnDemandTags
+		managed := ApplyKeepTop(options, hopts, candidates)
+		if managed != c.managed {
+			t.Fatalf("keep-top %d: manages %d, want %d (on demand %v)", c.keepTop, managed, c.managed, onDemand)
+		}
+		for _, out := range options.Outbounds {
+			if out.Lazy && slices.Contains(onDemand, out.Tag) {
+				t.Fatalf("keep-top %d: %s, tested on demand only, is managed by keep top", c.keepTop, out.Tag)
+			}
+		}
+		if c.managed == 0 && options.Experimental.Monitoring.KeepTop != nil {
+			t.Fatalf("keep-top %d: keep top on for a group it keeps whole", c.keepTop)
+		}
+		if err := libbox.CheckConfigOptions(options); err != nil {
+			t.Fatalf("sing-box rejected the config: %v", err)
+		}
+	}
+}

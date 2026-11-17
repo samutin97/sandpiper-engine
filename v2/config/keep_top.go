@@ -133,9 +133,20 @@ func ApplyKeepTop(options *option.Options, hopt *HiddifyOptions, candidates []st
 	if count <= 0 && !answering && len(countries) == 0 {
 		return 0
 	}
+	// SP3-03: only the proxies the monitoring tests in its cycles (the automatic groups' members).
+	// The others are tested on demand only (OnDemandTags): keep top waited for their first ping,
+	// which never came, and counted them as not answering ("KEEP TOP 6 outbounds have no result
+	// after 30s" for a profile whose automatic group has 3). Its count is thus at most the size of
+	// the automatic group, and keep top is off when it would keep the whole group.
+	onDemand := make(map[string]bool, len(options.Experimental.Monitoring.OnDemandTags))
+	for _, tag := range options.Experimental.Monitoring.OnDemandTags {
+		onDemand[tag] = true
+	}
 	wanted := make(map[string]bool, len(candidates))
 	for _, tag := range candidates {
-		wanted[tag] = true
+		if !onDemand[tag] {
+			wanted[tag] = true
+		}
 	}
 	var managed []*option.Outbound
 	for i := range options.Outbounds {
