@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hiddify/hiddify-core/v2/config"
+	"github.com/hiddify/hiddify-core/v2/hcommon/constants"
 
 	"github.com/sagernet/sing-box/option"
 )
@@ -105,7 +106,7 @@ func readConfigContent(configPath string) (ConfigResult, error) {
 			fmt.Println("Error creating request:", err)
 			return ConfigResult{}, err
 		}
-		req.Header.Set("User-Agent", "HiddifyNext/4.0.0("+runtime.GOOS+") like ClashMeta v2ray sing-box")
+		req.Header.Set("User-Agent", standaloneUserAgent())
 		resp, err := client.Do(req)
 		if err != nil {
 			fmt.Println("Error making GET request:", err)
@@ -168,19 +169,14 @@ func buildStandaloneConfig(ctx context.Context, ropt *config.ReadOptions, hopts 
 	}
 
 	finalconfig.Log.Output = ""
-	finalconfig.Experimental = &option.ExperimentalOptions{
-		ClashAPI: &option.ClashAPIOptions{
-			ExternalUI: "webui",
-		},
+	// W4-05: the experimental part is the builder's, as in the app: the cache file and the
+	// monitoring the groups refer to (replacing it all failed the start with "outbound not found:
+	// lowest in group select"), and the Clash API as the builder makes it. It used to open on the
+	// fixed 16756 (0.0.0.0 with LAN access) without a secret; now it listens only when the settings
+	// ask for it (clash-api-listen), on 127.0.0.1, a free port unless one is set, with a secret.
+	if api := clashController(finalconfig.Experimental); api != nil {
+		fmt.Printf("Clash API on http://%s (its secret is in the built config)\n", api.ExternalController)
 	}
-	// finalconfig.Experimental.ClashAPI.ExternalUI = "webui"
-	if hopts.AllowConnectionFromLAN {
-		finalconfig.Experimental.ClashAPI.ExternalController = "0.0.0.0:16756"
-	} else {
-		finalconfig.Experimental.ClashAPI.ExternalController = "127.0.0.1:16756"
-	}
-
-	fmt.Printf("Open http://localhost:6756/ui/?secret=%s in your browser\n", finalconfig.Experimental.ClashAPI.Secret)
 
 	if err := Setup(
 		&SetupRequest{
@@ -251,4 +247,34 @@ func ReadHiddifyOptionsAt(path string) (*config.HiddifyOptions, error) {
 		}
 	}
 	return &options, nil
+}
+
+// clashController is the Clash API of the config when it listens, else nil.
+func clashController(experimental *option.ExperimentalOptions) *option.ClashAPIOptions {
+	if experimental == nil || experimental.ClashAPI == nil || experimental.ClashAPI.ExternalController == "" {
+		return nil
+	}
+	return experimental.ClashAPI
+}
+
+// subscriptionAppVersion is the upstream app version the subscription user agent names when this
+// core was built without a version.
+const subscriptionAppVersion = "5.9.8"
+
+// standaloneUserAgent is the user agent the CLI downloads a subscription with: the app's
+// (lib/core/model/app_info_entity.dart, userAgentFor), so a server answers the CLI as it answers
+// the app: "HiddifyNext/<upstream version> (<os>)" and the capability tokens.
+func standaloneUserAgent() string {
+	version := strings.TrimPrefix(constants.Version, "v")
+	if cut := strings.IndexAny(version, "-+"); cut >= 0 {
+		version = version[:cut]
+	}
+	if version == "" || version[0] < '0' || version[0] > '9' {
+		version = subscriptionAppVersion
+	}
+	operatingSystem := runtime.GOOS
+	if operatingSystem == "darwin" {
+		operatingSystem = "macos" // as Dart names it
+	}
+	return fmt.Sprintf("HiddifyNext/%s (%s) awg31", version, operatingSystem)
 }
