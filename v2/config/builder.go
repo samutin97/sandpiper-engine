@@ -877,6 +877,11 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 
 	dnsRules = append(dnsRules, forceDirectRules...)
 
+	// SP3-06: the TUN's own subnets come before every other rule (tun_subnet.go).
+	if tun := tunInboundOptions(options); tun != nil {
+		routeRules = append(routeRules, tunSubnetRules(tun)...)
+	}
+
 	// An IPv6 connection is refused at once, before its handshake, so the app falls back to IPv4
 	// instead of being accepted and then closed by the proxy: every one while IPv6 is off for the
 	// apps (see ipv6ForClients); otherwise those through a proxy the monitoring found without
