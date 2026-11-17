@@ -71,7 +71,7 @@ const (
 var (
 	OutboundMainDetour       = OutboundSelectTag
 	OutboundWARPConfigDetour = OutboundDirectFragmentTag
-	PredefinedOutboundTags   = []string{OutboundDirectTag, OutboundBypassTag, OutboundSelectTag, OutboundURLTestTag, OutboundDirectFragmentTag, ChainExtraSecurityTag, ChainUnblockerTag}
+	PredefinedOutboundTags   = []string{OutboundDirectTag, OutboundBypassTag, OutboundSelectTag, OutboundURLTestTag, OutboundDirectFragmentTag, ChainExtraSecurityTag, ChainUnblockerTag, OutboundTieredTag}
 )
 
 // TODO include selectors
@@ -200,6 +200,8 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 	var tags []string
 	// manualOnly are the proxies kept out of the automatic groups (UDP, see auto_group.go)
 	manualOnly := map[string]bool{}
+	// the proxies that carry their traffic over UDP, for the tiered group's checks
+	udpTags := map[string]bool{}
 	// the subscription's own automatic choice (a panel's urltest "Auto"), nil without one
 	profileAuto := profileURLTestMembers(input.Outbounds)
 	// OutboundMainProxyTag = OutboundSelectTag
@@ -249,7 +251,8 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 			}
 			if !strings.Contains(out.Tag, "§hide§") {
 				tags = append(tags, out.Tag)
-				if udpProxy(out.Type, out.Options) && !opt.UDPEndpointsInAuto {
+				udpTags[out.Tag] = udpProxy(out.Type, out.Options)
+				if udpTags[out.Tag] && !opt.UDPEndpointsInAuto {
 					manualOnly[out.Tag] = true
 				}
 			}
@@ -268,7 +271,8 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 
 		if !strings.Contains(out.Tag, "§hide§") {
 			tags = append(tags, out.Tag)
-			if udpProxy(out.Type, out.Options) && !opt.UDPEndpointsInAuto {
+			udpTags[out.Tag] = udpProxy(out.Type, out.Options)
+			if udpTags[out.Tag] && !opt.UDPEndpointsInAuto {
 				manualOnly[out.Tag] = true
 			}
 		}
@@ -376,6 +380,13 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 		case DefaultProxyFirst:
 		default:
 			defaultSelect = balancer.Tag
+		}
+		// the subscription server's ranking: its group first, and what select starts on
+		if tiered := tierGroup(opt, tags, udpTags); tiered != nil {
+			outbounds = append([]option.Outbound{*tiered}, outbounds...)
+			selectorTags = append([]string{tiered.Tag}, selectorTags...)
+			defaultSelect = tiered.Tag
+			fmt.Printf("tiered group: %d of %d proxies, by the server's policy\n", len(tiered.Options.(*option.SelectorOutboundOptions).Outbounds), len(tags))
 		}
 	}
 	selector := option.Outbound{

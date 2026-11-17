@@ -92,6 +92,10 @@ type HiddifyOptions struct {
 	// without a pinSHA256 / pcs pin). Off by default: such a proxy is left out of the config, as
 	// anyone on the path can read its password and traffic.
 	AllowInsecure bool `json:"allow-insecure,omitempty"`
+	// TierPolicy is the subscription server's ranking of its proxies (its profile-policy header)
+	// with the host and path the checks use: the core then builds the tiered group and chooses in
+	// it (tier_group.go, hcore's tiered controller). The app sends it for the active profile only.
+	TierPolicy *TierPolicyOptions `json:"tier-policy,omitempty"`
 
 	DNSOptions
 	InboundOptions
