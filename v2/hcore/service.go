@@ -23,6 +23,12 @@ import (
 // interrupted, so a stop does not wait for a slow start (a download, a handshake) to finish; nil when
 // nothing stops it.
 func NewService(ctx context.Context, options option.Options, stop <-chan struct{}) (*daemon.StartedService, error) {
+	return newService(ctx, options, stop, false)
+}
+
+// newService is NewService; the core's own service (main) also keeps the rule of the tiered group's
+// last resort from its start (tierStartGuard).
+func newService(ctx context.Context, options option.Options, stop <-chan struct{}, main bool) (*daemon.StartedService, error) {
 
 	// ctx = filemanager.WithDefault(ctx, sWorkingPath, sTempPath, sUserID, sGroupID)
 	// features that start programs or write the system come from no config here (HC-03)
@@ -40,6 +46,11 @@ func NewService(ctx context.Context, options option.Options, stop <-chan struct{
 			&hiddifyMainServiceManager{},
 		},
 	}
+	var guard *tierStartGuard
+	if main {
+		guard = &tierStartGuard{}
+		bopts.ExtraServices = append(bopts.ExtraServices, guard)
+	}
 	watch := newStopwatch("start/service")
 	err := libbox.CheckConfigOptions(&options)
 	if err != nil {
@@ -47,6 +58,9 @@ func NewService(ctx context.Context, options option.Options, stop <-chan struct{
 	}
 	watch.step("checking the config")
 	instance := daemon.NewStartedService(bopts)
+	if guard != nil {
+		guard.service = instance
+	}
 	if stop != nil {
 		started := make(chan struct{})
 		defer close(started)

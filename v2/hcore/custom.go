@@ -13,6 +13,8 @@ func errorWrapper(state MessageType, err error) (*CoreInfoResponse, error) {
 
 func StopAndAlert(msgType MessageType, message string) {
 	stopConnectivityWatcher()
+	// as a stop: the user's agreements to last resorts end, the tiered group's choice is settled
+	endTieredRun()
 	SetCoreStatus(CoreStates_STOPPED, msgType, message)
 
 	if ss := static.StartedService; ss != nil {

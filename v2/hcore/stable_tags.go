@@ -19,6 +19,17 @@ var lastProfile struct {
 	items []config.ProxyItem // the profile's proxies as last built, with their stable tags
 }
 
+// profileFingerprints are the fingerprints of the proxies of the profile at path as it was built
+// last, by tag; nil for another profile.
+func profileFingerprints(path string) map[string]string {
+	lastProfile.Lock()
+	defer lastProfile.Unlock()
+	if lastProfile.path != path {
+		return nil
+	}
+	return config.Fingerprints(lastProfile.items)
+}
+
 // stableProfileTags renames input's proxies to the tags they had the last time this profile was
 // built, when their options are the same, and remembers them for the next time. It returns the
 // profile's proxies with their tags and fingerprints; nil when they could not be read, and then

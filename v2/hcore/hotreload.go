@@ -113,10 +113,15 @@ func reloadRunning(ctx context.Context, in *StartRequest) (MessageType, error) {
 	if err := contextErr(ctx); err != nil {
 		return MessageType_HOT_RELOAD_FAILED, fmt.Errorf("hot reload cancelled: %w", err)
 	}
+	// the tiered group's choice is carried over: one the new config would have to ask the user for
+	// waits first (see tierBeforeReload)
+	restoreTiered := tierBeforeReload(pendingTierPlan.Load())
 	result, err := static.StartedService.HotReload(serviceContext(ctx), options)
 	if err != nil {
+		restoreTiered()
 		return MessageType_HOT_RELOAD_FAILED, err
 	}
+	tierAfterReload(pendingTierPlan.Load())
 	static.previousStartRequest = in
 	saveLastStartRequest(in)
 	config.SaveCurrentConfig(ctx, filepath.Join(sWorkingPath, "data/current-config.json"), *options)

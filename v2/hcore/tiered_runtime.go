@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/sing-box/common/monitoring"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/daemon"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/group"
 	M "github.com/sagernet/sing/common/metadata"
@@ -49,20 +50,26 @@ const (
 	tierNetworkSettle = 2 * time.Second
 )
 
-// pendingTierPlan is the plan of the config built last (buildRunningConfig); the runtime started
-// with the connectivity watcher takes it.
-var pendingTierPlan atomic.Pointer[tierSetup]
+// pendingTierPlan is the plan of the config built last (buildRunningConfig); runningTierPlan the
+// plan of the config the core runs, from its start (or the reload that brought it) on. nil: no
+// tiered group.
+var pendingTierPlan, runningTierPlan atomic.Pointer[tierSetup]
 
 type tierSetup struct {
-	plan      *tiered.Plan
-	host      string
-	path      string
-	testURL   string
-	configTag string
+	plan    *tiered.Plan
+	host    string
+	path    string
+	testURL string
+	// consentKeys name the user's agreement to each last resort that asks for one (and only those):
+	// the profile, its policy and the proxy itself (its options). An agreement holds for that proxy
+	// of that profile, in this run of the core: another profile with a proxy of the same tag, a new
+	// policy, or a proxy whose options changed under its tag asks again.
+	consentKeys map[string]string
 }
 
-// noteTierPlan keeps the tiered plan of a built config, nil without a tiered group.
-func noteTierPlan(hopt *config.HiddifyOptions, opts *option.Options) {
+// noteTierPlan keeps the tiered plan of a config built from the profile at profilePath, nil
+// without a tiered group.
+func noteTierPlan(hopt *config.HiddifyOptions, opts *option.Options, profilePath string) {
 	if opts == nil || hopt == nil {
 		pendingTierPlan.Store(nil)
 		return
@@ -79,7 +86,157 @@ func noteTierPlan(hopt *config.HiddifyOptions, opts *option.Options) {
 			setup.path = tp.ProbePath
 		}
 	}
+	setup.consentKeys = tierConsentKeys(plan, profilePath, hopt.TierPolicy.Policy, profileFingerprints(profilePath))
 	pendingTierPlan.Store(setup)
+}
+
+// tierConsentKeys are the keys of the agreements to plan's last resorts (see tierSetup).
+func tierConsentKeys(plan *tiered.Plan, profile, policy string, fingerprints map[string]string) map[string]string {
+	keys := map[string]string{}
+	for _, tag := range plan.Reserves() {
+		sum := sha256.Sum256([]byte(profile + "\x00" + policy + "\x00" + tag + "\x00" + fingerprints[tag]))
+		keys[tag] = hex.EncodeToString(sum[:])
+	}
+	return keys
+}
+
+// reserve: tag is a last resort of this config that asks for the user's agreement.
+func (s *tierSetup) reserve(tag string) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.consentKeys[tag]
+	return ok
+}
+
+// needsConsent: tag is such a last resort, and the user has not agreed to it.
+func (s *tierSetup) needsConsent(tag string) bool {
+	if s == nil {
+		return false
+	}
+	key, ok := s.consentKeys[tag]
+	return ok && !tierConsented(key)
+}
+
+// The rule of the last resort, kept here and only here: the tiered group is never on a last resort
+// that asks for the user's agreement before the user gave it (for that proxy of that profile, in
+// this run), so neither the apps' connections nor the monitoring's tests reach its server. Every
+// selection in the group goes through tierSelect or tierSettle: the controller's own, at the start
+// of a config before its inbounds start (tierStartGuard), around a reload, at the stop. Until the
+// agreement, the group waits on config.OutboundTieredWaitTag, whose connections are refused.
+
+// tierChoice is the tiered selector, as the rule uses it.
+type tierChoice interface {
+	SelectOutbound(tag string) bool
+}
+
+// tierSelect selects tag in the group; a last resort waiting for the agreement gets the wait instead.
+func tierSelect(sel tierChoice, setup *tierSetup, tag string) error {
+	if setup.needsConsent(tag) {
+		sel.SelectOutbound(config.OutboundTieredWaitTag)
+		return errors.New("waits for the user's agreement: " + tag)
+	}
+	if !sel.SelectOutbound(tag) {
+		return errors.New("not in the tiered group: " + tag)
+	}
+	return nil
+}
+
+// tierSettle checks the group's choice now (from the cache of an earlier run, carried by a reload,
+// or left by the stop): a last resort waiting for the agreement, or the wait, gives way to the first
+// proxy that needs no agreement (the wait when there is none), the group's start; setup nil (a group
+// without a plan) holds the group.
+func tierSettle(sel tierChoice, now string, setup *tierSetup) {
+	target := now
+	switch {
+	case setup == nil:
+		target = config.OutboundTieredWaitTag
+	case now == config.OutboundTieredWaitTag || setup.needsConsent(now):
+		target = config.OutboundTieredWaitTag
+		for _, cand := range setup.plan.Candidates {
+			if !setup.needsConsent(cand.Tag) {
+				target = cand.Tag
+				break
+			}
+		}
+	}
+	if target != now {
+		sel.SelectOutbound(target)
+		Log(LogLevel_INFO, LogType_CORE, "tiers: the group starts on ", target, ", not on ", now)
+	}
+}
+
+// tierStartGuard keeps the rule when a config starts. The selectors take their choice from the
+// cache file once the outbounds start (a run that ended without a stop, the app killed by the
+// system or a crash, left the last resort there); an extra service starts after them and before the
+// inbounds, the monitoring's first tests and the lazy endpoints' first connection, and settles the
+// group there. A config without the group overwrites the group's cached choice, so that a later
+// config with one never takes it up.
+type tierStartGuard struct {
+	service *daemon.StartedService
+}
+
+func (g *tierStartGuard) Name() string { return "tierStartGuard" }
+
+func (g *tierStartGuard) Start(stage adapter.StartStage, _ *adapter.Scope) error {
+	if stage != adapter.StartStateStart || g.service == nil {
+		return nil
+	}
+	instance := g.service.Instance()
+	if instance == nil || instance.Box() == nil {
+		return nil
+	}
+	setup := pendingTierPlan.Load()
+	runningTierPlan.Store(setup)
+	if out, ok := instance.Box().Outbound().Outbound(config.OutboundTieredTag); ok {
+		if sel, ok := out.(*group.Selector); ok {
+			tierSettle(sel, groupNow(sel), setup)
+		}
+		return nil
+	}
+	if cache := instance.CacheFile(); cache != nil {
+		if now := cache.LoadSelected(config.OutboundTieredTag); now != "" && now != config.OutboundTieredWaitTag {
+			if err := cache.StoreSelected(config.OutboundTieredTag, config.OutboundTieredWaitTag); err != nil {
+				Log(LogLevel_WARNING, LogType_CORE, "tiers: cache: ", err.Error())
+			}
+		}
+	}
+	return nil
+}
+
+func (g *tierStartGuard) Close() error { return nil }
+
+// tierBeforeReload keeps the rule over a hot reload, which carries the group's choice into the new
+// config (and the cache): a choice the new config would have to ask the user for again (another
+// profile, policy or proxy), or the old config's last resort when the new one has no group, goes to
+// the wait first. restore puts it back when the reload fails and the old config runs on.
+func tierBeforeReload(next *tierSetup) (restore func()) {
+	sel := (&tierEnv{}).tieredGroup()
+	if sel == nil {
+		return func() {}
+	}
+	now := groupNow(sel)
+	if !tierReloadHolds(now, runningTierPlan.Load(), next) {
+		return func() {}
+	}
+	sel.SelectOutbound(config.OutboundTieredWaitTag)
+	return func() { sel.SelectOutbound(now) }
+}
+
+// tierReloadHolds: the group's choice now must wait before a reload from running to next.
+func tierReloadHolds(now string, running, next *tierSetup) bool {
+	if next == nil {
+		return running.reserve(now)
+	}
+	return next.needsConsent(now)
+}
+
+// tierAfterReload: the reloaded config runs; its group is settled as at a start.
+func tierAfterReload(next *tierSetup) {
+	runningTierPlan.Store(next)
+	if sel := (&tierEnv{}).tieredGroup(); sel != nil {
+		tierSettle(sel, groupNow(sel), next)
+	}
 }
 
 var tierRun struct {
@@ -94,27 +251,28 @@ var tierRun struct {
 // group; static.lock must be held.
 func startTieredRuntime() {
 	stopTieredRuntime()
-	setup := pendingTierPlan.Load()
+	setup := runningTierPlan.Load()
+	// the agreements of another profile, policy or proxy end here
+	keepTierConsents(setup)
 	ctx := static.Context()
 	if setup == nil || ctx == nil || static.Box() == nil {
 		return
 	}
-	box := static.Box()
-	sel, ok := box.Outbound().Outbound(config.OutboundTieredTag)
-	if !ok {
+	sel := (&tierEnv{}).tieredGroup()
+	if sel == nil {
 		return
 	}
-	if _, isSelector := sel.(*group.Selector); !isSelector {
-		return
-	}
+	tierSettle(sel, groupNow(sel), setup)
 	runCtx, cancel := context.WithCancel(ctx)
 	env := &tierEnv{setup: setup}
 	ctl := tiered.New(env, setup.plan, tierStore{})
 	ctl.OnChange = notifyTierState
-	// the user's agreement to a last resort holds for the core's run, over reloads
-	ctl.OnConsent = rememberTierConsent
-	for _, tag := range tierConsentsNow() {
-		ctl.Consent(tag)
+	// the user's agreement to a last resort holds for the core's run with this profile, over reloads
+	ctl.OnConsent = func(tag string) { rememberTierConsent(setup.consentKeys[tag]) }
+	for tag, key := range setup.consentKeys {
+		if tierConsented(key) {
+			ctl.Consent(tag)
+		}
 	}
 	tierRun.Lock()
 	tierRun.cancel, tierRun.done, tierRun.ctl = cancel, make(chan struct{}), ctl
@@ -181,65 +339,71 @@ func notifyTierState() {
 	}
 }
 
-// tierConsents are the last-resort proxies the user agreed to in this run of the core.
+// tierConsents are the user's agreements to last resorts in this run of the core, by their keys
+// (tierSetup.consentKeys).
 var tierConsents struct {
 	sync.Mutex
-	tags map[string]bool
+	keys map[string]bool
 }
 
-func rememberTierConsent(tag string) {
+func rememberTierConsent(key string) {
+	if key == "" {
+		return
+	}
 	tierConsents.Lock()
 	defer tierConsents.Unlock()
-	if tierConsents.tags == nil {
-		tierConsents.tags = map[string]bool{}
+	if tierConsents.keys == nil {
+		tierConsents.keys = map[string]bool{}
 	}
-	tierConsents.tags[tag] = true
+	tierConsents.keys[key] = true
 }
 
-func tierConsentsNow() []string {
+func tierConsented(key string) bool {
 	tierConsents.Lock()
 	defer tierConsents.Unlock()
-	var tags []string
-	for tag := range tierConsents.tags {
-		tags = append(tags, tag)
+	return tierConsents.keys[key]
+}
+
+// keepTierConsents keeps the agreements to setup's last resorts only (none for nil): the config the
+// core runs now.
+func keepTierConsents(setup *tierSetup) {
+	tierConsents.Lock()
+	defer tierConsents.Unlock()
+	kept := map[string]bool{}
+	if setup != nil {
+		for _, key := range setup.consentKeys {
+			if tierConsents.keys[key] {
+				kept[key] = true
+			}
+		}
 	}
-	return tags
+	tierConsents.keys = kept
 }
 
 // tierUntestable are the proxies nothing may test now: the last resorts still waiting for the user's
 // agreement (a test is a handshake with the server).
 func tierUntestable() map[string]bool {
-	tierRun.Lock()
-	ctl := tierRun.ctl
-	tierRun.Unlock()
-	if ctl == nil {
+	setup := runningTierPlan.Load()
+	if setup == nil {
 		return nil
 	}
 	untestable := map[string]bool{}
-	for _, tag := range ctl.NeedsConsent() {
-		untestable[tag] = true
+	for tag := range setup.consentKeys {
+		if setup.needsConsent(tag) {
+			untestable[tag] = true
+		}
 	}
 	return untestable
 }
 
-// endTieredRun is the core's stop: the agreements end with the run, and a last resort the tiered
-// group uses is not what it starts on next time (the cache keeps a group's choice), so nothing talks
-// to its server at the next start before the user agrees again. static.lock must be held.
+// endTieredRun is the core's stop, after the controller's (also on a stop that alerts, an error or a
+// panic): the agreements end with the run, and the group's choice, which the cache keeps, is settled
+// for the next start, never a last resort the user will have to agree to again. static.lock must be
+// held.
 func endTieredRun() {
-	tierConsents.Lock()
-	tierConsents.tags = nil
-	tierConsents.Unlock()
-	setup := pendingTierPlan.Load()
-	sel := (&tierEnv{}).tieredGroup()
-	if setup == nil || sel == nil || len(setup.plan.Candidates) == 0 {
-		return
-	}
-	now := groupNow(sel)
-	for _, cand := range setup.plan.Candidates {
-		if cand.Tag == now && cand.Mode == tiered.ModeLastResort && cand.Confirm {
-			sel.SelectOutbound(setup.plan.Candidates[0].Tag)
-			return
-		}
+	keepTierConsents(nil)
+	if sel := (&tierEnv{}).tieredGroup(); sel != nil {
+		tierSettle(sel, groupNow(sel), runningTierPlan.Load())
 	}
 }
 
@@ -254,12 +418,14 @@ func tierState() string {
 	return ctl.State().JSON()
 }
 
-// tierConfirm passes the user's agreement to a last-resort proxy to the controller.
+// tierConfirm is the user's agreement to a last-resort proxy: kept at once (whatever the controller
+// does now, a later try included), then the controller chooses again in its loop (one pending
+// choice covers several taps).
 func tierConfirm(tag string) bool {
 	tierRun.Lock()
 	ctl, confirm := tierRun.ctl, tierRun.confirm
 	tierRun.Unlock()
-	if ctl == nil || ctl.State().Confirm != tag {
+	if ctl == nil || !ctl.Agree(tag) {
 		return false
 	}
 	select {
@@ -292,8 +458,9 @@ func adoptTieredGroup() {
 // runTiers is the controller's loop: its own wakes, a look every tierPoll at the network, the
 // user's pick in select and the monitoring's result of the proxy in use, and the user's agreement.
 func runTiers(ctx context.Context, ctl *tiered.Controller, env *tierEnv, confirm <-chan string) {
-	ctl.SetEnabled(ctx, env.tieredSelected())
+	// the network as the first walk finds it: a change during that walk is seen by the first poll
 	lastNetwork := env.Network()
+	ctl.SetEnabled(ctx, env.tieredSelected())
 	lastResult, _ := env.activeResult() // a failure before this run was looked at by its start
 	var passive passiveWatch
 	poll := time.NewTicker(tierPoll)
@@ -316,8 +483,9 @@ func runTiers(ctx context.Context, ctl *tiered.Controller, env *tierEnv, confirm
 		select {
 		case <-ctx.Done():
 			return
-		case tag := <-confirm:
-			ctl.Confirm(ctx, tag)
+		case <-confirm:
+			// the agreement is kept already (tierConfirm)
+			ctl.Evaluate(ctx, "the user agreed to the last resort")
 		case <-wakeC:
 			ctl.Tick(ctx)
 		case <-poll.C:
@@ -339,7 +507,7 @@ func runTiers(ctx context.Context, ctl *tiered.Controller, env *tierEnv, confirm
 				}
 			}
 			// the apps' connections through the proxy in use get nothing back: check it now
-			if tag := env.activeTag(); tag != "" {
+			if tag := env.activeTag(); tag != "" && tag != config.OutboundTieredWaitTag {
 				now := time.Now()
 				if passive.observe(now, tag, outboundDown(tag), connViews(now)) {
 					env.Log("tiers: " + tag + ": the connections through it get nothing back, checking it now")
@@ -411,11 +579,12 @@ func (e *tierEnv) Select(tag string) error {
 	if sel == nil {
 		return errors.New("no tiered group")
 	}
-	if !sel.SelectOutbound(tag) {
-		return errors.New("not in the tiered group: " + tag)
-	}
-	return nil
+	return tierSelect(sel, e.setup, tag)
 }
+
+func (e *tierEnv) Hold() error { return e.Select(config.OutboundTieredWaitTag) }
+
+func (e *tierEnv) Picked() bool { return e.tieredSelected() }
 
 // activeTag is the proxy the tiered group uses while it is the user's pick, else "".
 func (e *tierEnv) activeTag() string {
@@ -570,17 +739,26 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) (res
 	if _, err := io.WriteString(tlsConn, request); err != nil {
 		return tiered.CheckResult{Outcome: tiered.NoConnect}, true
 	}
-	reader := bufio.NewReader(tlsConn)
-	status, err := reader.ReadString('\n')
+	reader := bufio.NewReaderSize(tlsConn, tierHeaderLine)
+	headerRoom := tierHeaderBytes
+	status, err := readHeaderLine(reader, &headerRoom)
 	if err != nil || !strings.HasPrefix(status, "HTTP/1.") {
 		return tiered.CheckResult{Outcome: tiered.NoConnect}, true
 	}
 	latency := time.Since(start)
+	// the file itself or nothing: an error page, a redirect, a limit of requests is no transfer
+	// (whatever its size); the neutral check decides then (see Check)
+	if code := statusCode(status); code != 200 && code != 206 {
+		return tiered.CheckResult{Outcome: tiered.NoConnect, Latency: latency}, true
+	}
 	watchdog.Reset(tierCheckStall)
 	conn.SetDeadline(time.Time{})
 	length := int64(-1)
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readHeaderLine(reader, &headerRoom)
+		if errors.Is(err, errHeaderTooLong) {
+			return tiered.CheckResult{Outcome: tiered.NoConnect, Latency: latency}, true
+		}
 		if err != nil {
 			return tiered.CheckResult{Outcome: tiered.Stall, Latency: latency}, true
 		}
@@ -623,16 +801,55 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) (res
 			return tiered.CheckResult{Outcome: tiered.NoConnect, Latency: latency}, true
 		}
 	}
+	if got < freezeWindowEnd {
+		// an answer too short to show a freeze (an empty one, a page instead of the file) proves
+		// nothing about the proxy: the neutral check decides
+		return tiered.CheckResult{Outcome: tiered.NoConnect, Latency: latency}, true
+	}
 	result = tiered.CheckResult{Outcome: tiered.OK, Latency: latency}
-	if took := time.Since(bodyStart); got >= freezeWindowEnd && took > 0 && float64(got)/took.Seconds() < tierSlowBelow {
+	if took := time.Since(bodyStart); took > 0 && float64(got)/took.Seconds() < tierSlowBelow {
 		result.Outcome = tiered.Slow
 	}
 	return result, true
 }
 
 // freezeWindowEnd: a transfer that got this far went past where the "16 KB" freeze stops one
-// (14 to 25 KB).
+// (14 to 25 KB); a check that works got at least this much.
 const freezeWindowEnd = 32 << 10
+
+// Limits of the answer's header: a line, and the status line with every header line.
+const (
+	tierHeaderLine  = 4 << 10
+	tierHeaderBytes = 16 << 10
+)
+
+var errHeaderTooLong = errors.New("the answer's header is too long")
+
+// readHeaderLine reads a line of the answer's header within what room is left of it.
+func readHeaderLine(r *bufio.Reader, room *int) (string, error) {
+	line, err := r.ReadSlice('\n')
+	*room -= len(line)
+	if errors.Is(err, bufio.ErrBufferFull) || *room < 0 {
+		return "", errHeaderTooLong
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(line), nil
+}
+
+// statusCode is the code of an HTTP/1 status line, 0 when there is none.
+func statusCode(status string) int {
+	fields := strings.Fields(status)
+	if len(fields) < 2 || len(fields[1]) != 3 {
+		return 0
+	}
+	code, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0
+	}
+	return code
+}
 
 func minTime(a, b time.Time) time.Time {
 	if a.Before(b) {

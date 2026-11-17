@@ -222,7 +222,7 @@ func startServiceLocked(ctx context.Context, in *StartRequest) (coreResponse *Co
 	if routerMode {
 		prepareRouterHost()
 	}
-	instance, err := NewService(serviceContext(ctx), *options, stopSignal(ctx))
+	instance, err := newService(serviceContext(ctx), *options, stopSignal(ctx), true)
 	watch.step("starting the service")
 	if err != nil && config.AutoRedirectFailed(options, err) {
 		if routerMode {
@@ -236,7 +236,7 @@ func startServiceLocked(ctx context.Context, in *StartRequest) (coreResponse *Co
 				// a raw config comes back as it was
 				config.DropAutoRedirect(options)
 				config.SaveCurrentConfig(ctx, currentBuildConfigPath, *options)
-				instance, err = NewService(serviceContext(ctx), *options, stopSignal(ctx))
+				instance, err = newService(serviceContext(ctx), *options, stopSignal(ctx), true)
 				watch.step("starting the service without auto-redirect")
 			}
 		}
@@ -257,6 +257,8 @@ func startServiceLocked(ctx context.Context, in *StartRequest) (coreResponse *Co
 		return cancelledStart(err)
 	}
 	static.StartedService = instance
+	// the tiered plan of the config that runs now (its start guard already set it)
+	runningTierPlan.Store(pendingTierPlan.Load())
 	if static.debug {
 		dumpGoroutinesToFile(fmt.Sprint(sWorkingPath, "/data/goroutine-start.log"))
 	}

@@ -44,8 +44,9 @@ func queueStopLocked() <-chan operationResult {
 // stopLocked stops the core; static.lock must be held.
 func stopLocked() (*CoreInfoResponse, error) {
 	watch := newStopwatch("stop")
-	endTieredRun()
+	// the controller first, so nothing selects in the tiered group after its run ends
 	stopConnectivityWatcher()
+	endTieredRun()
 	watch.step("ending the connectivity watcher")
 	// the next run may be on another network: this run's speeds show as from an earlier one
 	cacheSpeedTests()

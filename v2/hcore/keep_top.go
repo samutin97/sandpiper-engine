@@ -34,7 +34,7 @@ func buildRunningConfig(ctx context.Context, in *StartRequest) (*option.Options,
 		recordDelegatedSystemProxy(options)
 		markEngineLeftovers(options)
 		// the tiered controller of this config starts with the connectivity watcher
-		noteTierPlan(static.HiddifyOptions, options)
+		noteTierPlan(static.HiddifyOptions, options, in.ConfigPath)
 	}
 	return options, err
 }
