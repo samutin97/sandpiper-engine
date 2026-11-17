@@ -20,6 +20,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/monitoring"
 	"github.com/sagernet/sing-box/common/urltest"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/group"
 	M "github.com/sagernet/sing/common/metadata"
@@ -110,6 +111,11 @@ func startTieredRuntime() {
 	env := &tierEnv{setup: setup}
 	ctl := tiered.New(env, setup.plan, tierStore{})
 	ctl.OnChange = notifyTierState
+	// the user's agreement to a last resort holds for the core's run, over reloads
+	ctl.OnConsent = rememberTierConsent
+	for _, tag := range tierConsentsNow() {
+		ctl.Consent(tag)
+	}
 	tierRun.Lock()
 	tierRun.cancel, tierRun.done, tierRun.ctl = cancel, make(chan struct{}), ctl
 	tierRun.confirm = make(chan string, 1)
@@ -175,6 +181,68 @@ func notifyTierState() {
 	}
 }
 
+// tierConsents are the last-resort proxies the user agreed to in this run of the core.
+var tierConsents struct {
+	sync.Mutex
+	tags map[string]bool
+}
+
+func rememberTierConsent(tag string) {
+	tierConsents.Lock()
+	defer tierConsents.Unlock()
+	if tierConsents.tags == nil {
+		tierConsents.tags = map[string]bool{}
+	}
+	tierConsents.tags[tag] = true
+}
+
+func tierConsentsNow() []string {
+	tierConsents.Lock()
+	defer tierConsents.Unlock()
+	var tags []string
+	for tag := range tierConsents.tags {
+		tags = append(tags, tag)
+	}
+	return tags
+}
+
+// tierUntestable are the proxies nothing may test now: the last resorts still waiting for the user's
+// agreement (a test is a handshake with the server).
+func tierUntestable() map[string]bool {
+	tierRun.Lock()
+	ctl := tierRun.ctl
+	tierRun.Unlock()
+	if ctl == nil {
+		return nil
+	}
+	untestable := map[string]bool{}
+	for _, tag := range ctl.NeedsConsent() {
+		untestable[tag] = true
+	}
+	return untestable
+}
+
+// endTieredRun is the core's stop: the agreements end with the run, and a last resort the tiered
+// group uses is not what it starts on next time (the cache keeps a group's choice), so nothing talks
+// to its server at the next start before the user agrees again. static.lock must be held.
+func endTieredRun() {
+	tierConsents.Lock()
+	tierConsents.tags = nil
+	tierConsents.Unlock()
+	setup := pendingTierPlan.Load()
+	sel := (&tierEnv{}).tieredGroup()
+	if setup == nil || sel == nil || len(setup.plan.Candidates) == 0 {
+		return
+	}
+	now := groupNow(sel)
+	for _, cand := range setup.plan.Candidates {
+		if cand.Tag == now && cand.Mode == tiered.ModeLastResort && cand.Confirm {
+			sel.SelectOutbound(setup.plan.Candidates[0].Tag)
+			return
+		}
+	}
+}
+
 // tierState is the controller's state for the app, "" without a controller.
 func tierState() string {
 	tierRun.Lock()
@@ -227,6 +295,7 @@ func runTiers(ctx context.Context, ctl *tiered.Controller, env *tierEnv, confirm
 	ctl.SetEnabled(ctx, env.tieredSelected())
 	lastNetwork := env.Network()
 	lastResult, _ := env.activeResult() // a failure before this run was looked at by its start
+	var passive passiveWatch
 	poll := time.NewTicker(tierPoll)
 	defer poll.Stop()
 	wake := time.NewTimer(time.Hour)
@@ -266,6 +335,15 @@ func runTiers(ctx context.Context, ctl *tiered.Controller, env *tierEnv, confirm
 				lastResult = at
 				if failed {
 					ctl.ActiveFailed(ctx)
+					continue
+				}
+			}
+			// the apps' connections through the proxy in use get nothing back: check it now
+			if tag := env.activeTag(); tag != "" {
+				now := time.Now()
+				if passive.observe(now, tag, outboundDown(tag), connViews(now)) {
+					env.Log("tiers: " + tag + ": the connections through it get nothing back, checking it now")
+					ctl.ActiveFailed(ctx)
 				}
 			}
 		}
@@ -294,7 +372,8 @@ func tierSleep(ctx context.Context, d time.Duration) error {
 
 func (e *tierEnv) Log(message string) {
 	level := LogLevel_INFO
-	if strings.HasPrefix(message, "tiers: using") || strings.Contains(message, "TCP to the server") || strings.Contains(message, "last resort") || strings.Contains(message, "no proxy") {
+	if strings.HasPrefix(message, "tiers: using") || strings.Contains(message, "TCP to the server") || strings.Contains(message, "last resort") ||
+		strings.Contains(message, "no proxy") || strings.Contains(message, "get nothing back") {
 		level = LogLevel_WARNING
 	}
 	Log(level, LogType_CORE, message)
@@ -336,6 +415,17 @@ func (e *tierEnv) Select(tag string) error {
 		return errors.New("not in the tiered group: " + tag)
 	}
 	return nil
+}
+
+// activeTag is the proxy the tiered group uses while it is the user's pick, else "".
+func (e *tierEnv) activeTag() string {
+	if !e.tieredSelected() {
+		return ""
+	}
+	if sel := e.tieredGroup(); sel != nil {
+		return groupNow(sel)
+	}
+	return ""
 }
 
 // activeResult is the time of the monitoring's last result of the proxy the tiered group uses, and
@@ -391,11 +481,45 @@ func (e *tierEnv) Check(ctx context.Context, tag string) tiered.CheckResult {
 	if !ok {
 		return tiered.CheckResult{Outcome: tiered.NoConnect}
 	}
-	if e.setup.host == "" || e.setup.path == "" {
-		return urlTestCheck(ctx, out, e.setup.testURL)
+	// a tunnel (AmneziaWG, WireGuard) reaches what its server lets its clients reach, which need not
+	// be the server's own site: its check is the neutral one at once
+	if e.setup.host == "" || e.setup.path == "" || tunnelEndpoint(out) {
+		return neutralCheck(ctx, out, e.setup.testURL)
 	}
-	return transferCheck(ctx, out, e.setup.host, e.setup.path)
+	r, dialed := transferCheck(ctx, out, e.setup.host, e.setup.path)
+	if r.Outcome == tiered.NoConnect && dialed {
+		// the proxy connected, but the subscription's host did not answer through it: the
+		// server's exit may not lead back to the server itself. Not the proxy's fault.
+		e.Log("tiers: " + tag + ": the test path does not answer through it, a neutral check")
+		return neutralCheck(ctx, out, e.setup.testURL)
+	}
+	return r
 }
+
+// tunnelEndpoint: an AmneziaWG or WireGuard endpoint (or the lazy stand-in of one).
+func tunnelEndpoint(out adapter.Outbound) bool {
+	switch out.Type() {
+	case C.TypeAwg, C.TypeWireGuard:
+		return true
+	}
+	return false
+}
+
+// neutralCheck is a check through the proxy that needs nothing of the subscription's server: 64 KiB
+// from the speed test's host the app already uses (enough to see a freeze), else the URL test of the
+// settings, which the monitoring makes anyway.
+func neutralCheck(ctx context.Context, out N.Dialer, testURL string) tiered.CheckResult {
+	if r, _ := transferCheck(ctx, out, neutralHost, neutralTransferPath); r.Outcome != tiered.NoConnect {
+		return r
+	}
+	return urlTestCheck(ctx, out, testURL)
+}
+
+// neutralHost is the speed test's host (a test's own server in tests).
+var neutralHost = speedTestHost
+
+// neutralTransferPath asks the speed test's host for exactly tierCheckBytes.
+var neutralTransferPath = "/__down?bytes=" + strconv.Itoa(tierCheckBytes)
 
 func urlTestCheck(ctx context.Context, dialer N.Dialer, link string) tiered.CheckResult {
 	if link == "" {
@@ -417,7 +541,7 @@ var tierRootCAs *x509.CertPool
 // tunnel; see the limits above. A watchdog closes the connection when nothing came for its time (a
 // tunnel's connection may not keep a deadline): the answer within tierCheckAnswer, then a byte of
 // the body at least every tierCheckStall, all within tierCheckTotal.
-func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) tiered.CheckResult {
+func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) (result tiered.CheckResult, dialed bool) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, tierCheckTotal)
 	defer cancel()
@@ -425,7 +549,7 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) tier
 	conn, err := dialer.DialContext(dialCtx, N.NetworkTCP, M.ParseSocksaddrHostPort(host, 443))
 	dialCancel()
 	if err != nil {
-		return tiered.CheckResult{Outcome: tiered.NoConnect}
+		return tiered.CheckResult{Outcome: tiered.NoConnect}, false
 	}
 	defer conn.Close()
 	var stalled atomic.Bool
@@ -439,17 +563,17 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) tier
 	conn.SetDeadline(start.Add(tierCheckAnswer))
 	tlsConn := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, RootCAs: tierRootCAs})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		return tiered.CheckResult{Outcome: tiered.NoConnect}
+		return tiered.CheckResult{Outcome: tiered.NoConnect}, true
 	}
 	request := "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nRange: bytes=0-" +
 		strconv.Itoa(tierCheckBytes-1) + "\r\nConnection: close\r\n\r\n"
 	if _, err := io.WriteString(tlsConn, request); err != nil {
-		return tiered.CheckResult{Outcome: tiered.NoConnect}
+		return tiered.CheckResult{Outcome: tiered.NoConnect}, true
 	}
 	reader := bufio.NewReader(tlsConn)
 	status, err := reader.ReadString('\n')
 	if err != nil || !strings.HasPrefix(status, "HTTP/1.") {
-		return tiered.CheckResult{Outcome: tiered.NoConnect}
+		return tiered.CheckResult{Outcome: tiered.NoConnect}, true
 	}
 	latency := time.Since(start)
 	watchdog.Reset(tierCheckStall)
@@ -458,7 +582,7 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) tier
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			return tiered.CheckResult{Outcome: tiered.Stall, Latency: latency}
+			return tiered.CheckResult{Outcome: tiered.Stall, Latency: latency}, true
 		}
 		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
@@ -490,20 +614,20 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) tier
 			}
 			if ctx.Err() != nil && !stalled.Load() && got >= freezeWindowEnd {
 				// still coming when the time was up, past where a freeze stops a transfer: slow
-				return tiered.CheckResult{Outcome: tiered.Slow, Latency: latency}
+				return tiered.CheckResult{Outcome: tiered.Slow, Latency: latency}, true
 			}
 			var netErr net.Error
 			if got > 0 || stalled.Load() || errors.As(err, &netErr) && netErr.Timeout() {
-				return tiered.CheckResult{Outcome: tiered.Stall, Latency: latency}
+				return tiered.CheckResult{Outcome: tiered.Stall, Latency: latency}, true
 			}
-			return tiered.CheckResult{Outcome: tiered.NoConnect, Latency: latency}
+			return tiered.CheckResult{Outcome: tiered.NoConnect, Latency: latency}, true
 		}
 	}
-	result := tiered.CheckResult{Outcome: tiered.OK, Latency: latency}
+	result = tiered.CheckResult{Outcome: tiered.OK, Latency: latency}
 	if took := time.Since(bodyStart); got >= freezeWindowEnd && took > 0 && float64(got)/took.Seconds() < tierSlowBelow {
 		result.Outcome = tiered.Slow
 	}
-	return result
+	return result, true
 }
 
 // freezeWindowEnd: a transfer that got this far went past where the "16 KB" freeze stops one

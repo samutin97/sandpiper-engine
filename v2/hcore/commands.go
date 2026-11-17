@@ -315,7 +315,7 @@ func (h *HiddifyInstance) UrlTest(in *UrlTestRequest) (*hcommon.Response, error)
 		if h.Box() == nil || ctx == nil {
 			return nil, E.New("service not ready")
 		}
-		monitoring.Get(ctx).TestOutbounds(in.Tags, "asked for by the app")
+		monitoring.Get(ctx).TestOutbounds(withoutUntestable(in.Tags, ""), "asked for by the app")
 		return &hcommon.Response{Code: hcommon.ResponseCode_OK}, nil
 	}
 	if in.Tag == "" {
@@ -340,6 +340,16 @@ func (h *HiddifyInstance) UrlTest(in *UrlTestRequest) (*hcommon.Response, error)
 		return nil, E.New("service not ready")
 	}
 	monitor := monitoring.Get(h.Context())
+	// a group's test leaves out the last resorts that wait for the user's agreement (a test is a
+	// handshake with the server); a tap on one of them alone still tests it
+	if out, ok := box.Outbound().Outbound(in.Tag); ok {
+		if group, isGroup := out.(adapter.OutboundGroup); isGroup {
+			if members := group.All(); len(withoutUntestable(members, groupNow(group))) < len(members) {
+				monitor.TestOutbounds(withoutUntestable(members, groupNow(group)), "asked for by the app")
+				return &hcommon.Response{Code: hcommon.ResponseCode_OK}, nil
+			}
+		}
+	}
 	monitor.TestNow(in.Tag)
 	// router := box.Outbound()
 	// abstractOutboundGroup, isLoaded := router.Outbound(groupTag)
@@ -458,4 +468,20 @@ func (s *CoreService) GetLANIP(ctx context.Context, req *hcommon.Empty) (*LANIPR
 	}
 	// Fallback to loopback if no physical LAN interface is found
 	return &LANIPResponse{Ip: "127.0.0.1"}, nil
+}
+
+// withoutUntestable is tags without the last resorts that wait for the user's agreement, but for
+// the one a group uses now (keep).
+func withoutUntestable(tags []string, keep string) []string {
+	untestable := tierUntestable()
+	if len(untestable) == 0 {
+		return tags
+	}
+	var kept []string
+	for _, tag := range tags {
+		if !untestable[tag] || tag == keep {
+			kept = append(kept, tag)
+		}
+	}
+	return kept
 }
