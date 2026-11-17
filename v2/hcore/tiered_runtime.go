@@ -646,13 +646,14 @@ func (e *tierEnv) Check(ctx context.Context, tag string) tiered.CheckResult {
 	if box == nil {
 		return tiered.CheckResult{Outcome: tiered.NoConnect}
 	}
-	out, ok := box.Outbound().Outbound(tag)
+	proxy, ok := box.Outbound().Outbound(tag)
 	if !ok {
 		return tiered.CheckResult{Outcome: tiered.NoConnect}
 	}
+	out := boundedDialer{proxy}
 	// a tunnel (AmneziaWG, WireGuard) reaches what its server lets its clients reach, which need not
 	// be the server's own site: its check is the neutral one at once
-	if e.setup.host == "" || e.setup.path == "" || tunnelEndpoint(out) {
+	if e.setup.host == "" || e.setup.path == "" || tunnelEndpoint(proxy) {
 		return neutralCheck(ctx, out, e.setup.testURL)
 	}
 	r, dialed := transferCheck(ctx, out, e.setup.host, e.setup.path)
@@ -663,6 +664,36 @@ func (e *tierEnv) Check(ctx context.Context, tag string) tiered.CheckResult {
 		return neutralCheck(ctx, out, e.setup.testURL)
 	}
 	return r
+}
+
+// boundedDialer dials through a proxy for a check, giving up at the end of the dial's context even
+// when the proxy's dial does not: a gRPC proxy's dials wait for the one already under way
+// (hiddify-sing-box transport/v2raygrpc Client.connect, under connAccess), and that one may wait for
+// as long as an app's connection asked for it, while the server does not answer. A check is never
+// held longer than its time; a connection that comes after that is closed.
+type boundedDialer struct{ N.Dialer }
+
+func (d boundedDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	type dialed struct {
+		conn net.Conn
+		err  error
+	}
+	done := make(chan dialed, 1)
+	go func() {
+		conn, err := d.Dialer.DialContext(ctx, network, destination)
+		done <- dialed{conn, err}
+	}()
+	select {
+	case r := <-done:
+		return r.conn, r.err
+	case <-ctx.Done():
+		go func() {
+			if r := <-done; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
 }
 
 // tunnelEndpoint: an AmneziaWG or WireGuard endpoint (or the lazy stand-in of one).

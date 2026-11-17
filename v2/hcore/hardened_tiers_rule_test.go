@@ -2,6 +2,7 @@ package hcore
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/hiddify/hiddify-core/v2/config"
 	"github.com/hiddify/hiddify-core/v2/tiered"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 // The rule of the last resort in the core (tierSelect, tierSettle, around a reload, at the stop),
@@ -224,5 +226,33 @@ func TestTierTransferCheckNeedsTheFile(t *testing.T) {
 		if r, _ := transferCheck(context.Background(), dialer, "example.com", "/files/sample.bin"); r.Outcome != tiered.OK {
 			t.Fatalf("%d: %s", code, r.Outcome)
 		}
+	}
+}
+
+// a proxy whose dial ignores its context and never ends (a gRPC proxy waiting behind another dial)
+type stuckDialer struct{ release chan struct{} }
+
+func (d stuckDialer) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	<-d.release
+	return nil, net.ErrClosed
+}
+
+func (d stuckDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, net.ErrClosed
+}
+
+// A check through such a proxy still ends within its time (the controller's loop, and the user's
+// agreement, never wait behind it).
+func TestTierCheckEndsWhenTheProxysDialDoesNot(t *testing.T) {
+	d := stuckDialer{release: make(chan struct{})}
+	defer close(d.release)
+	start := time.Now()
+	r, dialed := transferCheck(context.Background(), boundedDialer{d}, "example.com", "/files/sample.bin")
+	if r.Outcome != tiered.NoConnect || dialed || time.Since(start) > tierCheckAnswer+time.Second {
+		t.Fatalf("%s, dialed %v, after %s", r.Outcome, dialed, time.Since(start))
+	}
+	start = time.Now()
+	if r := urlTestCheck(context.Background(), boundedDialer{d}, "https://example.com/generate_204"); r.Outcome != tiered.NoConnect || time.Since(start) > tierCheckAnswer+time.Second {
+		t.Fatalf("url test: %s after %s", r.Outcome, time.Since(start))
 	}
 }
