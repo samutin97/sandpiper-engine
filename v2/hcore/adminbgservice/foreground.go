@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/hiddify/hiddify-core/v2/hcore/adminbg"
+	"github.com/hiddify/hiddify-core/v2/hcore/vpnservice"
 	"google.golang.org/grpc"
 )
 
@@ -18,7 +19,9 @@ type ForegroundService struct {
 }
 
 // RunForeground serves the VPN service's API on listen in this process, authenticated by secret,
-// instead of as a system service: the AppImage's VPN, started as root through pkexec.
+// instead of as a system service: the AppImage's VPN, started as root through pkexec. Listen on
+// port 0 takes a free port; Endpoint tells which, and the certificate the API presents (the app
+// that started it reads both from its stdout, cmd/cmd_core_service.go).
 func RunForeground(listen string, secret string) (*ForegroundService, error) {
 	if len(secret) < adminbg.MinSecretLength {
 		return nil, fmt.Errorf("the control secret is too short")
@@ -30,6 +33,11 @@ func RunForeground(listen string, secret string) (*ForegroundService, error) {
 		return nil, err
 	}
 	return &ForegroundService{server: server, next: next}, nil
+}
+
+// Endpoint is where the API listens and the certificate it presents (none on macOS).
+func (f *ForegroundService) Endpoint() vpnservice.Endpoint {
+	return f.next.endpoint
 }
 
 // Close stops the engine, restoring what it changed (TUN, routes), and the API.

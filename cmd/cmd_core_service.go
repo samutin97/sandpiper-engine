@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strings"
@@ -19,7 +20,15 @@ import (
 // app connects to it as to the installed service. The first stdin line is the control secret
 // (pkexec clears the environment); stdin then stays open, and its end, like the app's exit, stops
 // the engine and the process.
-const CoreServiceReadyLine = "HIDDIFY_SERVICE_READY"
+//
+// Before the ready line, CoreServiceListenPrefix gives the address the API listens on (a free port
+// by default, never upstream's 18021) and CoreServiceCertPrefix the certificate it presents (base64
+// PEM): the app trusts only that one, as with the installed service's endpoint file.
+const (
+	CoreServiceReadyLine    = "HIDDIFY_SERVICE_READY"
+	CoreServiceListenPrefix = "HIDDIFY_SERVICE_LISTEN "
+	CoreServiceCertPrefix   = "HIDDIFY_SERVICE_CERT "
+)
 
 var coreServiceOptions struct {
 	listen   string
@@ -39,7 +48,7 @@ var commandCoreService = &cobra.Command{
 
 func init() {
 	flags := commandCoreService.Flags()
-	flags.StringVar(&coreServiceOptions.listen, "listen", "127.0.0.1:18021", "control API listen address")
+	flags.StringVar(&coreServiceOptions.listen, "listen", defaultCoreListen, "control API listen address (port 0: a free port, printed after "+strings.TrimSpace(CoreServiceListenPrefix)+")")
 	flags.Int32Var(&coreServiceOptions.ownerPID, "owner-pid", 0, "the app's process: the service stops when it is gone")
 	// The AppImage's AppRun runs this after the service exits: a service that crashed or was killed
 	// left its engine's routing, and nothing restarts it as systemd does the installed one.
@@ -65,6 +74,9 @@ func runCoreService() int {
 		writeCoreLine(CoreErrorPrefix + oneLine(err.Error()))
 		return 1
 	}
+	endpoint := service.Endpoint()
+	writeCoreLine(CoreServiceListenPrefix + endpoint.Address)
+	writeCoreLine(CoreServiceCertPrefix + base64.StdEncoding.EncodeToString([]byte(endpoint.Certificate)))
 	writeCoreLine(CoreServiceReadyLine)
 	hprocess.DetachStdio()
 

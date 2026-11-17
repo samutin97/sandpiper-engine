@@ -11,18 +11,22 @@ import (
 
 	hcommon "github.com/hiddify/hiddify-core/v2/hcommon"
 	"github.com/hiddify/hiddify-core/v2/hcore/adminbg"
+	"github.com/hiddify/hiddify-core/v2/hcore/vpnservice"
 	hutils "github.com/hiddify/hiddify-core/v2/hutils"
 	grpc "google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
 
-// the fork's own port, never upstream Hiddify's 18020 (see hcore's adminBgServicePort)
-const adminBgServicePort uint16 = 18420
+var adminBgServiceRunning = false
 
-var (
-	adminBgServiceAddress = fmt.Sprintf("127.0.0.1:%d", adminBgServicePort)
-	adminBgServiceRunning = false
-)
+// serviceAnswers reports whether the installed service runs and is the service: the endpoint it
+// published answers with its certificate (macOS: its fixed port answers).
+func serviceAnswers() bool {
+	endpoint, err := vpnservice.ReadEndpoint()
+	return err == nil && endpoint.Reachable(500*time.Millisecond)
+}
 
 func isSupportedOS() bool {
 	return runtime.GOOS == "windows" || runtime.GOOS == "linux"
@@ -60,7 +64,7 @@ func startTunnelRequestWithFailover(opt *AdminBgStartRequest, installService boo
 }
 
 func startTunnelRequest(opt *AdminBgStartRequest, installService bool) (bool, error) {
-	if !hutils.IsPortInUse(adminBgServicePort) {
+	if !serviceAnswers() {
 		if installService {
 			return runTunnelService(opt)
 		}
@@ -126,9 +130,23 @@ func ExitAdminBgService() (bool, error) {
 	return true, nil
 }
 
-// dialTunnel attaches the control secret when the service was installed with one (macOS).
+// dialTunnel connects to the installed service where it published that it listens, trusting
+// only the certificate it published (vpnservice.Endpoint; macOS: its fixed port, without TLS),
+// and attaches the control secret.
 func dialTunnel(ctx context.Context) (*grpc.ClientConn, context.Context, error) {
-	conn, err := grpc.Dial(adminBgServiceAddress, grpc.WithInsecure())
+	endpoint, err := vpnservice.ReadEndpoint()
+	if err != nil {
+		return nil, ctx, err
+	}
+	creds := insecure.NewCredentials()
+	config, err := endpoint.TLSConfig()
+	if err != nil {
+		return nil, ctx, err
+	}
+	if config != nil {
+		creds = credentials.NewTLS(config)
+	}
+	conn, err := grpc.Dial(endpoint.Address, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, ctx, err
 	}
@@ -154,17 +172,9 @@ func runTunnelService(opt *AdminBgStartRequest) (bool, error) {
 }
 
 func getTunnelServicePath() string {
-	var fullPath string
 	exePath, _ := os.Executable()
 	binFolder := filepath.Dir(exePath)
-	switch runtime.GOOS {
-	case "windows":
-		fullPath = "SandpiperCore.exe" // the core's Makefile, WIN_CLINAME
-	case "darwin":
-		fallthrough
-	default:
-		fullPath = "HiddifyCli"
-	}
+	fullPath := vpnservice.CLINameOn(runtime.GOOS)
 
 	abspath, _ := filepath.Abs(filepath.Join(binFolder, fullPath))
 	return abspath

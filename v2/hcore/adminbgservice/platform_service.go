@@ -13,6 +13,7 @@ import (
 	"github.com/hiddify/hiddify-core/v2/hcore"
 	"github.com/hiddify/hiddify-core/v2/hcore/adminbg"
 	"github.com/hiddify/hiddify-core/v2/hcore/hprocess"
+	"github.com/hiddify/hiddify-core/v2/hcore/vpnservice"
 	"github.com/kardianos/service"
 	"google.golang.org/grpc"
 )
@@ -22,11 +23,10 @@ var logger service.Logger
 type hiddifyNext struct {
 	adminBg *hiddifyAdminBG
 	secret  string
+	// where the API listens and the certificate it presents (vpnservice.Endpoint); without a
+	// certificate on macOS, whose service keeps its fixed port and serves without TLS
+	endpoint vpnservice.Endpoint
 }
-
-// port is the service's loopback API: the fork's own, never the 18020 of upstream Hiddify's
-// service, which may run on the same computer.
-var port int = 18420
 
 func allowAdminBgMethod(method string) error {
 	switch method {
@@ -49,23 +49,32 @@ func (m *hiddifyNext) StartAdminBgGrpcServer(listenAddressG string) (*grpc.Serve
 	// an engine killed with the service (a crash, SIGKILL) left its TUN's routing behind: the host
 	// has no network until the app connects again, so undo it before waiting for the app
 	CleanupLeftovers()
+	// B-01: never an API without the secret (upstream served one when the file was missing)
+	if len(m.secret) < adminbg.MinSecretLength {
+		return nil, fmt.Errorf("the VPN service has no control secret: install it again")
+	}
 	lis, err := net.Listen("tcp", listenAddressG)
 	if err != nil {
 		log.Printf("failed to listen: %v", err)
 		return nil, err
 	}
-	var serverOptions []grpc.ServerOption
-	if m.secret != "" {
-		serverOptions = adminbg.ServerOptions(m.secret, allowAdminBgMethod)
+	serverOptions := adminbg.ServerOptions(m.secret, allowAdminBgMethod)
+	m.endpoint = vpnservice.Endpoint{Address: lis.Addr().String()}
+	if vpnservice.PublishesEndpoint() {
+		endpoint, creds, err := serviceTLS(lis)
+		if err != nil {
+			lis.Close()
+			return nil, fmt.Errorf("the VPN service's certificate: %w", err)
+		}
+		m.endpoint = endpoint
+		serverOptions = append(serverOptions, creds)
 	}
 	s := grpc.NewServer(serverOptions...)
 	m.adminBg = &hiddifyAdminBG{}
 	RegisterHiddifyAdminBGServer(s, m.adminBg)
-	if m.secret != "" {
-		adminbg.RegisterControl(s)
-	}
+	adminbg.RegisterControl(s)
 
-	log.Printf("Server listening on %s", listenAddressG)
+	log.Printf("Server listening on %s", m.endpoint.Address)
 	go func() {
 		if err := s.Serve(lis); err != nil {
 			log.Printf("failed to serve: %v", err)
@@ -79,18 +88,29 @@ func (m *hiddifyNext) Start(s service.Service) error {
 	if err := WriteRunningBinaryStamp(); err != nil {
 		return fmt.Errorf("record tunnel binary stamp: %w", err)
 	}
-	if secret, err := LoadControlSecret(); err == nil {
-		m.secret = secret
-	} else if os.IsNotExist(err) {
-		log.Printf("tunnel control secret missing; gRPC is unauthenticated until reinstall")
-	} else {
+	// B-01: without its secret the service does not serve at all; the app installs it again, which
+	// writes a new secret
+	secret, err := LoadControlSecret()
+	if err != nil {
+		return fmt.Errorf("tunnel control secret: %w", err)
+	}
+	m.secret = secret
+	// a free port on Windows and Linux, published with the certificate; macOS's fixed one
+	if _, err := m.StartAdminBgGrpcServer(vpnservice.ServiceListenAddress()); err != nil {
 		return err
 	}
-	_, err := m.StartAdminBgGrpcServer(fmt.Sprintf("127.0.0.1:%d", port))
-	return err
+	if vpnservice.PublishesEndpoint() {
+		if err := publishEndpoint(m.endpoint); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *hiddifyNext) Stop(s service.Service) error {
+	if vpnservice.PublishesEndpoint() {
+		withdrawEndpoint()
+	}
 	if m.adminBg == nil {
 		return nil
 	}
@@ -146,10 +166,7 @@ func installOwner() string {
 // upstream Hiddify installed on the same computer (HiddifyAdminBG), nor is taken for it. macOS keeps
 // the upstream label until the macOS app is renamed (its install scripts and bundle use it).
 func osServiceName() string {
-	if runtime.GOOS == "darwin" {
-		return "HiddifyAdminBG"
-	}
-	return "SandpiperAdminBG"
+	return vpnservice.ServiceNameOn(runtime.GOOS)
 }
 
 func serviceRunArguments() []string {
@@ -161,15 +178,19 @@ func serviceRunArguments() []string {
 
 func StartAdminBgService(goArg string) (int, string) {
 	dataDirectory := serviceDataDirectory()
-	if err := os.MkdirAll(dataDirectory, 0o755); err != nil {
-		return 3, fmt.Sprintf("Error: %v", err)
+	// Made (and checked) only by the elevated install and by the service itself: the other commands
+	// (start, stop, connect) run as the user, and a folder they made would belong to the user.
+	if goArg == "install" || goArg == "run" {
+		if err := prepareDataDirectory(dataDirectory); err != nil {
+			return 3, fmt.Sprintf("Error: %v", err)
+		}
 	}
 	if goArg == "install" {
 		if _, err := EnsureControlSecret(installOwner()); err != nil {
 			return 3, fmt.Sprintf("Error: %v", err)
 		}
 	}
-	// Windows/Linux: HiddifyCli admin_bgservice run.
+	// Windows: SandpiperAdmin.exe admin_bgservice run; Linux: HiddifyCli admin_bgservice run.
 	// macOS: the copied .app must get --tunnel so AppDelegate runs parseCli instead of the Flutter UI.
 	svcConfig := &service.Config{
 		Name:             osServiceName(),
@@ -278,15 +299,9 @@ func control(s service.Service, goArg string) (int, string) {
 
 // serviceDisplayName and serviceDescription: what Windows' Services list shows (macOS: as upstream).
 func serviceDisplayName() string {
-	if runtime.GOOS == "darwin" {
-		return "Hiddify VPN"
-	}
-	return "Sandpiper Service"
+	return vpnservice.ServiceDisplayNameOn(runtime.GOOS)
 }
 
 func serviceDescription() string {
-	if runtime.GOOS == "darwin" {
-		return "Hiddify virtual private network"
-	}
-	return "Runs the tunnel the Sandpiper app starts in VPN mode."
+	return vpnservice.ServiceDescriptionOn(runtime.GOOS)
 }

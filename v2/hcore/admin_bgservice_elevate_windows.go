@@ -10,12 +10,13 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/hiddify/hiddify-core/v2/hcore/vpnservice"
 	"golang.org/x/sys/windows"
 )
 
 // adminLauncherName is the elevation helper beside the console launcher (the core's Makefile,
 // WIN_ADMINNAME).
-const adminLauncherName = "SandpiperAdmin.exe"
+const adminLauncherName = vpnservice.WindowsAdmin
 
 // elevateAdminBgInstall shows one UAC prompt and waits for install to finish.
 //

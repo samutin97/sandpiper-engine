@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,14 +14,21 @@ import (
 
 	"github.com/hiddify/hiddify-core/v2/hcommon"
 	"github.com/hiddify/hiddify-core/v2/hcore/buildid"
+	"github.com/hiddify/hiddify-core/v2/hcore/vpnservice"
 	hutils "github.com/hiddify/hiddify-core/v2/hutils"
 )
 
-// The VPN service's loopback port. Upstream Hiddify's service listens on 18020; a Sandpiper beside an
-// installed Hiddify must neither take that port nor talk to Hiddify's service. The app and the
-// other packages here use the same number (adminbgservice, core_interface_desktop_tun.dart,
-// AdminBgServiceController.swift).
-const adminBgServicePort uint16 = 18420
+// The VPN service has no fixed port on Windows and Linux (upstream Hiddify's listens on 18020, the
+// fork's first builds on 18420): it takes a free one at each start and publishes it with its
+// certificate (vpnservice.Endpoint). adminBgServicePort is the port it published, 0 when it has
+// published none.
+func adminBgServicePort() uint16 {
+	endpoint, err := vpnservice.ReadEndpoint()
+	if err != nil {
+		return 0
+	}
+	return uint16(endpoint.Port())
+}
 
 // IsAdmin reports whether this core process runs with administrator/root rights. The app
 // is in the same process, so it asks here instead of spawning `id -u` or PowerShell, which
@@ -99,7 +105,7 @@ func (s *CoreService) EnsureAdminBgService(req *EnsureAdminBgServiceRequest, str
 	}
 
 	if !adminBgServiceReady() {
-		_ = sendEnsureEvent(stream, EnsureAdminBgServiceProgress_ENSURE_ADMIN_BG_WAITING_FOR_ELEVATION, "Administrator permission is required to install the VPN service", adminBgServicePort)
+		_ = sendEnsureEvent(stream, EnsureAdminBgServiceProgress_ENSURE_ADMIN_BG_WAITING_FOR_ELEVATION, "Administrator permission is required to install the VPN service", adminBgServicePort())
 		if err := ensureAdminBgServiceInstalled(cliPath, req.GetOwnerUser()); err != nil {
 			msg := err.Error()
 			progress := EnsureAdminBgServiceProgress_ENSURE_ADMIN_BG_FAILED_OTHER
@@ -115,7 +121,7 @@ func (s *CoreService) EnsureAdminBgService(req *EnsureAdminBgServiceRequest, str
 		}
 	}
 
-	_ = sendEnsureEvent(stream, EnsureAdminBgServiceProgress_ENSURE_ADMIN_BG_SERVICE_STARTING, "Starting the VPN service", adminBgServicePort)
+	_ = sendEnsureEvent(stream, EnsureAdminBgServiceProgress_ENSURE_ADMIN_BG_SERVICE_STARTING, "Starting the VPN service", adminBgServicePort())
 
 	tmp, err := writeAdminBgConnectRequest(req)
 	if err != nil {
@@ -134,7 +140,7 @@ func (s *CoreService) EnsureAdminBgService(req *EnsureAdminBgServiceRequest, str
 		return nil
 	}
 
-	return sendEnsureEvent(stream, EnsureAdminBgServiceProgress_ENSURE_ADMIN_BG_SERVICE_CONNECTED, "VPN service is ready", adminBgServicePort)
+	return sendEnsureEvent(stream, EnsureAdminBgServiceProgress_ENSURE_ADMIN_BG_SERVICE_CONNECTED, "VPN service is ready", adminBgServicePort())
 }
 
 func sendEnsureEvent(stream Core_EnsureAdminBgServiceServer, progress EnsureAdminBgServiceProgress, message string, port uint16) error {
@@ -218,28 +224,13 @@ func parseSettingsMap(settingsJSON string) (map[string]any, error) {
 	return root, nil
 }
 
-func adminBgDataDir() string {
-	if dir := os.Getenv("HIDDIFY_TUNNEL_DATA"); dir != "" {
-		return dir
-	}
-	switch runtime.GOOS {
-	case "windows":
-		base := os.Getenv("PROGRAMDATA")
-		if base == "" {
-			base = `C:\ProgramData`
-		}
-		return filepath.Join(base, "Sandpiper", "AdminBgService") // not upstream Hiddify's folder
-	default:
-		return "/var/lib/sandpiper-admin-bgservice"
-	}
-}
-
+// The service's folder and files: vpnservice, the same package the service writes them with.
 func adminBgSecretPath() string {
-	return filepath.Join(adminBgDataDir(), "control.secret")
+	return vpnservice.SecretPath()
 }
 
 func adminBgBuildStampPath() string {
-	return filepath.Join(adminBgDataDir(), "build.id")
+	return vpnservice.BuildStampPath()
 }
 
 func adminBgServiceReady() bool {
@@ -256,12 +247,10 @@ func adminBgServiceReady() bool {
 	if want == "" || want == "unset" || have == "" || have == "unset" || want != have {
 		return false
 	}
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", adminBgServicePort), 200*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
+	// the service's published address answers with its published certificate: a program that took
+	// the port of a stopped service is not taken for it
+	endpoint, err := vpnservice.ReadEndpoint()
+	return err == nil && endpoint.Reachable(500*time.Millisecond)
 }
 
 func waitAdminBgServiceReady(timeout time.Duration) error {
@@ -338,7 +327,7 @@ func writeAdminBgConnectRequest(req *EnsureAdminBgServiceRequest) (string, error
 	if err != nil {
 		return "", err
 	}
-	f, err := os.CreateTemp("", "sandpiper-admin-bgservice-*.json")
+	f, err := os.CreateTemp("", vpnservice.ConnectRequestPattern)
 	if err != nil {
 		return "", err
 	}

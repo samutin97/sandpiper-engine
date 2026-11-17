@@ -27,6 +27,7 @@ import (
 	hcommon "github.com/hiddify/hiddify-core/v2/hcommon"
 	"github.com/hiddify/hiddify-core/v2/hcore"
 	"github.com/hiddify/hiddify-core/v2/hcore/adminbg"
+	"github.com/hiddify/hiddify-core/v2/hcore/vpnservice"
 )
 
 type hiddifyAdminBG struct {
@@ -47,13 +48,19 @@ func (s *hiddifyAdminBG) Start(ctx context.Context, in *AdminBgStartRequest) (re
 			response = &AdminBgResponse{Message: err.Error()}
 		}
 	}()
-	if in.GetConfigContent() != "" {
-		if err := s.startFullCore(in); err != nil {
-			return &AdminBgResponse{Message: err.Error()}, err
-		}
-		return &AdminBgResponse{Message: "OK"}, nil
+	// B-01: no bridge from the API. A start without a configuration made the service open a TUN as
+	// SYSTEM/root and send the whole computer's traffic to whatever local port the request named,
+	// so any program that held the secret could take all of it. The app always sends its
+	// configuration (the engine runs in the service); only upstream's `admin_bgservice activate`
+	// command asked for the bridge (startBridge, kept for it, is no longer reached from here).
+	if in.GetConfigContent() == "" {
+		err = fmt.Errorf("the VPN service runs only a configuration the app sends")
+		return &AdminBgResponse{Message: err.Error()}, err
 	}
-	return s.startBridge(in)
+	if err := s.startFullCore(in); err != nil {
+		return &AdminBgResponse{Message: err.Error()}, err
+	}
+	return &AdminBgResponse{Message: "OK"}, nil
 }
 
 func (s *hiddifyAdminBG) startBridge(in *AdminBgStartRequest) (*AdminBgResponse, error) {
@@ -103,9 +110,9 @@ func fullCoreOptions(in *AdminBgStartRequest) (*adminbg.Options, error) {
 	if err != nil {
 		return nil, err
 	}
-	settings := in.GetSettingsJson()
-	if settings == "" {
-		settings = "{}"
+	settings, err := privilegedSettings(in.GetSettingsJson())
+	if err != nil {
+		return nil, err
 	}
 	return &adminbg.Options{
 		BasePath:           base,
@@ -339,10 +346,10 @@ func makeTunnelConfig(in *AdminBgStartRequest) option.Options {
 							// upstream's names for now
 							ProcessName: []string{
 								"Sandpiper.exe",
-								"SandpiperCore.exe",
-								"SandpiperCoreEngine.exe",
+								vpnservice.WindowsCLI,
+								vpnservice.WindowsEngine,
 								"Hiddify",
-								"HiddifyCli",
+								vpnservice.LinuxCLI,
 							},
 						},
 						RuleAction: option.RuleAction{
@@ -420,9 +427,6 @@ func vpnInterface(routeOutput string) string {
 }
 
 func tunInterfaceName() string {
-	if runtime.GOOS == "darwin" {
-		return ""
-	}
 	// not upstream's HiddifyAdminBg: two adapters of one name would collide
-	return "SandpiperAdminBg"
+	return vpnservice.TunInterfaceNameOn(runtime.GOOS)
 }
