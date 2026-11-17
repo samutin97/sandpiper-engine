@@ -403,6 +403,7 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 			outbounds = append([]option.Outbound{tieredGroup}, append(outbounds, wait)...)
 			selectorTags = append([]string{tieredGroup.Tag}, selectorTags...)
 			defaultSelect = tieredGroup.Tag
+			monitorTheWait(options)
 			fmt.Printf("tiered group: %d of %d proxies, by the server's policy\n", len(tierPlan.Candidates), len(tags))
 		}
 	}

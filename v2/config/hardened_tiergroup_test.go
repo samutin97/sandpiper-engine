@@ -254,3 +254,47 @@ func TestQuietTunnelsAreLazy(t *testing.T) {
 		t.Fatal("the last resort's AWG endpoint is not lazy with UDP endpoints in the automatic groups")
 	}
 }
+
+// The monitoring refuses a config whose group has a member it leaves out (by type): every member of
+// every group is an outbound or endpoint it knows, with the tiered group's wait among them; without
+// a policy the excluded types are as before.
+func TestEveryGroupMemberIsMonitored(t *testing.T) {
+	for _, settings := range []string{
+		`{"enable-tun":true}`,
+		tierSettings(t, panelPolicy),
+		tierSettings(t, "v=1;t=last-resort,confirm:1,2,3,4,5,6,7,8,9"), // only last resorts: the wait in lowest
+	} {
+		options := buildPanelProfile(t, panelSubscription, settings)
+		m := options.Experimental.Monitoring
+		types := map[string]string{}
+		for _, out := range options.Outbounds {
+			types[out.Tag] = out.Type
+		}
+		for _, end := range options.Endpoints {
+			types[end.Tag] = end.Type
+		}
+		for _, out := range options.Outbounds {
+			var members []string
+			switch o := out.Options.(type) {
+			case *option.SelectorOutboundOptions:
+				members = o.Outbounds
+			case *option.BalancerOutboundOptions:
+				members = o.Outbounds
+			case *option.URLTestOutboundOptions:
+				members = o.Outbounds
+			default:
+				continue
+			}
+			for _, tag := range members {
+				typ, ok := types[tag]
+				if !ok || slices.Contains(m.ExcludeTypes, typ) {
+					t.Fatalf("%s: %s's member %q (%q) is not monitored, excluded %v", settings, out.Tag, tag, typ, m.ExcludeTypes)
+				}
+			}
+		}
+		_, tiered := types[OutboundTieredTag]
+		if tiered != !slices.Contains(m.ExcludeTypes, "block") || tiered != slices.Contains(m.OnDemandTags, OutboundTieredWaitTag) {
+			t.Fatalf("%s: excluded %v, on demand %q", settings, m.ExcludeTypes, m.OnDemandTags)
+		}
+	}
+}

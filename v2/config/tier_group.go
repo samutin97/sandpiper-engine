@@ -149,6 +149,20 @@ func tierGroup(plan *tiered.Plan) (group, wait option.Outbound) {
 	return group, wait
 }
 
+// monitorTheWait lets the monitoring know the wait member: it refuses a group with a member of a type
+// it leaves out, and block is one of them. The wait is the config's only block outbound (the
+// profile's own are dropped), tested only while selected, where it fails at once.
+func monitorTheWait(options *option.Options) {
+	if options.Experimental == nil || options.Experimental.Monitoring == nil {
+		return
+	}
+	m := options.Experimental.Monitoring
+	m.ExcludeTypes = slices.DeleteFunc(slices.Clone(m.ExcludeTypes), func(typ string) bool { return typ == C.TypeBlock })
+	if !slices.Contains(m.OnDemandTags, OutboundTieredWaitTag) {
+		m.OnDemandTags = append(m.OnDemandTags, OutboundTieredWaitTag)
+	}
+}
+
 // TierPlan is the plan of the built config's tiered group, nil without one: the policy bound to the
 // profile's proxies (select's members but the groups), as the builder bound it, and nil when that is
 // not the group's members (it always is; a plan that did not match the group would let the core
