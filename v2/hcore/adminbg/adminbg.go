@@ -70,16 +70,25 @@ func AllowCoreMethod(method string) error {
 		hcore.Core_LogListener_FullMethodName, hcore.Core_SelectOutbound_FullMethodName,
 		hcore.Core_UrlTest_FullMethodName, hcore.Core_UrlTestActive_FullMethodName,
 		hcore.Core_UploadTest_FullMethodName, hcore.Core_DownloadTest_FullMethodName,
-		hcore.Core_ClearSpeedTests_FullMethodName, hcore.Core_ExportDiagnostics_FullMethodName:
+		hcore.Core_ClearSpeedTests_FullMethodName, hcore.Core_ExportDiagnostics_FullMethodName,
+		hcore.Core_BlockJournal_FullMethodName:
 		return nil
 	}
 	return status.Error(codes.PermissionDenied, "method not allowed on the tunnel control service")
 }
 
-// AllowCoreRequest checks the arguments of an allowed call. Diagnostics are only returned inline:
-// a destination path would let the caller write as the privileged engine anywhere, and extra
-// files would let it put its own files there.
+// AllowCoreRequest checks the arguments of an allowed call. Diagnostics and the block journal's
+// report are only returned inline: a destination path would let the caller write as the privileged
+// engine anywhere, and extra files would let it put its own files there. Clearing the journal is
+// allowed: it deletes the journal's own files only.
 func AllowCoreRequest(method string, req any) error {
+	if method == hcore.Core_BlockJournal_FullMethodName {
+		journal, ok := req.(*hcore.BlockJournalRequest)
+		if !ok || journal.Export && !journal.Inline || journal.DestinationPath != "" || len(journal.ExtraFiles) > 0 {
+			return status.Error(codes.PermissionDenied, "only an inline journal report, without a path or files, on the tunnel control service")
+		}
+		return nil
+	}
 	if method != hcore.Core_ExportDiagnostics_FullMethodName {
 		return nil
 	}

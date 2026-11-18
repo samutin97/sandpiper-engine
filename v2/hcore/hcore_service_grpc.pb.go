@@ -52,6 +52,7 @@ const (
 	Core_ExportDiagnostics_FullMethodName     = "/hcore.Core/ExportDiagnostics"
 	Core_GetLocalProxyInfo_FullMethodName     = "/hcore.Core/GetLocalProxyInfo"
 	Core_DpiProbe_FullMethodName              = "/hcore.Core/DpiProbe"
+	Core_BlockJournal_FullMethodName          = "/hcore.Core/BlockJournal"
 )
 
 // CoreClient is the client API for Core service.
@@ -112,6 +113,10 @@ type CoreClient interface {
 	GetLocalProxyInfo(ctx context.Context, in *hcommon.Empty, opts ...grpc.CallOption) (*LocalProxyInfo, error)
 	// A diagnostic of the path to a server: TCP, TLS, 64 KiB down/up; see DpiProbeRequest. Hardened fork.
 	DpiProbe(ctx context.Context, in *DpiProbeRequest, opts ...grpc.CallOption) (*DpiProbeResponse, error)
+	// The journal of what stopped getting through (see BlockJournalRequest): its size, a clear, or a
+	// zip of it with the core's log (box.log) and the files the request adds, text scrubbed as in
+	// ExportDiagnostics, the journal itself as it is (it holds no user data). Hardened fork.
+	BlockJournal(ctx context.Context, in *BlockJournalRequest, opts ...grpc.CallOption) (*BlockJournalResponse, error)
 }
 
 type coreClient struct {
@@ -496,6 +501,16 @@ func (c *coreClient) DpiProbe(ctx context.Context, in *DpiProbeRequest, opts ...
 	return out, nil
 }
 
+func (c *coreClient) BlockJournal(ctx context.Context, in *BlockJournalRequest, opts ...grpc.CallOption) (*BlockJournalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BlockJournalResponse)
+	err := c.cc.Invoke(ctx, Core_BlockJournal_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoreServer is the server API for Core service.
 // All implementations must embed UnimplementedCoreServer
 // for forward compatibility.
@@ -554,6 +569,10 @@ type CoreServer interface {
 	GetLocalProxyInfo(context.Context, *hcommon.Empty) (*LocalProxyInfo, error)
 	// A diagnostic of the path to a server: TCP, TLS, 64 KiB down/up; see DpiProbeRequest. Hardened fork.
 	DpiProbe(context.Context, *DpiProbeRequest) (*DpiProbeResponse, error)
+	// The journal of what stopped getting through (see BlockJournalRequest): its size, a clear, or a
+	// zip of it with the core's log (box.log) and the files the request adds, text scrubbed as in
+	// ExportDiagnostics, the journal itself as it is (it holds no user data). Hardened fork.
+	BlockJournal(context.Context, *BlockJournalRequest) (*BlockJournalResponse, error)
 	mustEmbedUnimplementedCoreServer()
 }
 
@@ -659,6 +678,9 @@ func (UnimplementedCoreServer) GetLocalProxyInfo(context.Context, *hcommon.Empty
 }
 func (UnimplementedCoreServer) DpiProbe(context.Context, *DpiProbeRequest) (*DpiProbeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DpiProbe not implemented")
+}
+func (UnimplementedCoreServer) BlockJournal(context.Context, *BlockJournalRequest) (*BlockJournalResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BlockJournal not implemented")
 }
 func (UnimplementedCoreServer) mustEmbedUnimplementedCoreServer() {}
 func (UnimplementedCoreServer) testEmbeddedByValue()              {}
@@ -1215,6 +1237,24 @@ func _Core_DpiProbe_Handler(srv interface{}, ctx context.Context, dec func(inter
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Core_BlockJournal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BlockJournalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoreServer).BlockJournal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Core_BlockJournal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoreServer).BlockJournal(ctx, req.(*BlockJournalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Core_ServiceDesc is the grpc.ServiceDesc for Core service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1325,6 +1365,10 @@ var Core_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DpiProbe",
 			Handler:    _Core_DpiProbe_Handler,
+		},
+		{
+			MethodName: "BlockJournal",
+			Handler:    _Core_BlockJournal_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

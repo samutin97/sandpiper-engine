@@ -117,6 +117,8 @@ func ChangeHiddifySettings(in *ChangeHiddifySettingsRequest, insert bool) (*Core
 		}
 		// The log level no longer turns the core's debug mode on (HC-07): debug comes only
 		// from SetupRequest.debug, which the app sets in its own debug build.
+		// the block journal is on unless the setting says false
+		setJournalEnabled(static.HiddifyOptions.BlockJournal == nil || *static.HiddifyOptions.BlockJournal)
 	}()
 
 	if in.HiddifySettingsJson == "" {

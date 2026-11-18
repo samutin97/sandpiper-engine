@@ -61,6 +61,10 @@ service Core {
   rpc GetLocalProxyInfo (hcommon.Empty) returns (LocalProxyInfo);
   // A diagnostic of the path to a server: TCP, TLS, 64 KiB down/up; see DpiProbeRequest. Hardened fork.
   rpc DpiProbe (DpiProbeRequest) returns (DpiProbeResponse);
+  // The journal of what stopped getting through (see BlockJournalRequest): its size, a clear, or a
+  // zip of it with the core's log (box.log) and the files the request adds, text scrubbed as in
+  // ExportDiagnostics, the journal itself as it is (it holds no user data). Hardened fork.
+  rpc BlockJournal (BlockJournalRequest) returns (BlockJournalResponse);
 }
 
 

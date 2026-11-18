@@ -4,13 +4,12 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
+	stdtls "crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"io"
 	"net"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/monitoring"
+	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/daemon"
@@ -276,6 +276,8 @@ func startTieredRuntime() {
 	env := &tierEnv{setup: setup}
 	ctl := tiered.New(env, setup.plan, tierStore{})
 	ctl.OnChange = notifyTierState
+	// each decision goes to the block journal too
+	ctl.OnNote = journalNote
 	// the user's agreement to a last resort holds for the core's run with this profile, over reloads
 	ctl.OnConsent = func(tag string) { rememberTierConsent(setup.consentKeys[tag]) }
 	for tag, key := range setup.consentKeys {
@@ -532,6 +534,7 @@ func runTiers(ctx context.Context, ctl *tiered.Controller, env *tierEnv, confirm
 				now := time.Now()
 				if passive.observe(now, tag, outboundDown(tag), connViews(now)) {
 					env.Log("tiers: " + tag + ": the connections through it get nothing back, checking it now")
+					journalWrite("passive", "tag", tag, "srv", journalProxyOf(tag).Server)
 					ctl.ActiveFailed(ctx)
 				}
 			}
@@ -649,29 +652,15 @@ func (e *tierEnv) activeResult() (time.Time, bool) {
 // Network is the device's default network: offline without one; its id is a hash of its type,
 // name, gateways and Wi-Fi name, so the name never reaches a log or the store.
 func (e *tierEnv) Network() tiered.Network {
-	box := static.Box()
-	if box == nil {
-		return tiered.Network{}
-	}
-	nm := box.Network()
-	iface := nm.DefaultNetworkInterface()
-	if iface == nil {
-		return tiered.Network{}
-	}
-	h := sha256.New()
-	io.WriteString(h, strconv.Itoa(int(iface.Type))+"|"+iface.Name+"|")
-	gateways := make([]string, 0, len(iface.Gateways))
-	for _, gw := range iface.Gateways {
-		gateways = append(gateways, gw.String())
-	}
-	slices.Sort(gateways)
-	io.WriteString(h, strings.Join(gateways, ",")+"|"+nm.WIFIState().SSID)
-	return tiered.Network{ID: hex.EncodeToString(h.Sum(nil)[:4]), Online: true}
+	network, _ := defaultNetwork()
+	return network
 }
 
 // Check sends a request through the proxy tag: the first 64 KiB of the subscription's test file,
 // or, without one, the URL test of the settings.
 func (e *tierEnv) Check(ctx context.Context, tag string) tiered.CheckResult {
+	// each kind of check it makes writes a line of the block journal
+	ctx = withCheckTrace(ctx, &checkTrace{tag: tag, kind: "transfer"})
 	box := static.Box()
 	if box == nil {
 		return tiered.CheckResult{Outcome: tiered.NoConnect}
@@ -686,6 +675,7 @@ func (e *tierEnv) Check(ctx context.Context, tag string) tiered.CheckResult {
 	if e.setup.host == "" || e.setup.path == "" || tunnelEndpoint(proxy) {
 		return neutralCheck(ctx, out, e.setup.testURL)
 	}
+	setCheckKind(ctx, "transfer")
 	r, dialed := transferCheck(ctx, out, e.setup.host, e.setup.path)
 	if r.Outcome == tiered.NoConnect && dialed {
 		// the proxy connected, but the subscription's host did not answer through it: the
@@ -739,9 +729,11 @@ func tunnelEndpoint(out adapter.Outbound) bool {
 // from the speed test's host the app already uses (enough to see a freeze), else the URL test of the
 // settings, which the monitoring makes anyway.
 func neutralCheck(ctx context.Context, out N.Dialer, testURL string) tiered.CheckResult {
+	setCheckKind(ctx, "neutral")
 	if r, _ := transferCheck(ctx, out, neutralHost, neutralTransferPath); r.Outcome != tiered.NoConnect {
 		return r
 	}
+	setCheckKind(ctx, "urltest")
 	return urlTestCheck(ctx, out, testURL)
 }
 
@@ -751,12 +743,33 @@ var neutralHost = speedTestHost
 // neutralTransferPath asks the speed test's host for exactly tierCheckBytes.
 var neutralTransferPath = "/__down?bytes=" + strconv.Itoa(tierCheckBytes)
 
-func urlTestCheck(ctx context.Context, dialer N.Dialer, link string) tiered.CheckResult {
+func urlTestCheck(ctx context.Context, dialer N.Dialer, link string) (result tiered.CheckResult) {
 	if link == "" {
 		link = "https://www.google.com/generate_204"
 	}
 	ctx, cancel := context.WithTimeout(ctx, tierCheckAnswer)
 	defer cancel()
+	if trace := checkTraceOf(ctx); trace != nil {
+		// a URL test tells no stage of its own: the dial's trace tells a TCP connect that failed,
+		// the rest is the request through the proxy
+		dial := &tls.DialTrace{}
+		ctx = tls.WithDialTrace(ctx, dial)
+		start := time.Now()
+		var failure error
+		defer func() {
+			stage := "request"
+			if info := dial.Info(); info.ConnectErr && !info.Connected {
+				stage = "tcp"
+			}
+			trace.record(result, stage, 0, 0, failure, dial, time.Since(start))
+		}()
+		delay, err := urltest.URLTest(ctx, link, dialer)
+		if err != nil {
+			failure = err
+			return tiered.CheckResult{Outcome: tiered.NoConnect}
+		}
+		return tiered.CheckResult{Outcome: tiered.OK, Latency: time.Duration(delay) * time.Millisecond}
+	}
 	delay, err := urltest.URLTest(ctx, link, dialer)
 	if err != nil {
 		return tiered.CheckResult{Outcome: tiered.NoConnect}
@@ -775,12 +788,30 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) (res
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, tierCheckTotal)
 	defer cancel()
+	// for the block journal: the stage the check reached, the bytes of the body, the answer's code,
+	// the error that ended it, and the dial's way through the handshake gate
+	var (
+		stage   = "connect"
+		got     int64
+		code    int
+		failure error
+		dial    *tls.DialTrace
+	)
+	if trace := checkTraceOf(ctx); trace != nil {
+		dial = &tls.DialTrace{}
+		defer func() { trace.record(result, stage, got, code, failure, dial, time.Since(start)) }()
+	}
 	dialCtx, dialCancel := context.WithTimeout(ctx, tierCheckAnswer)
+	if dial != nil {
+		dialCtx = tls.WithDialTrace(dialCtx, dial)
+	}
 	conn, err := dialer.DialContext(dialCtx, N.NetworkTCP, M.ParseSocksaddrHostPort(host, 443))
 	dialCancel()
 	if err != nil {
+		failure = err
 		return tiered.CheckResult{Outcome: tiered.NoConnect}, false
 	}
+	stage = "tls"
 	defer conn.Close()
 	var stalled atomic.Bool
 	watchdog := time.AfterFunc(max(time.Until(start.Add(tierCheckAnswer)), 0), func() {
@@ -791,25 +822,29 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) (res
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 	conn.SetDeadline(start.Add(tierCheckAnswer))
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, RootCAs: tierRootCAs})
+	tlsConn := stdtls.Client(conn, &stdtls.Config{ServerName: host, MinVersion: stdtls.VersionTLS12, NextProtos: []string{"http/1.1"}, RootCAs: tierRootCAs})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		failure = err
 		return tiered.CheckResult{Outcome: tiered.NoConnect}, true
 	}
+	stage = "http"
 	request := "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nRange: bytes=0-" +
 		strconv.Itoa(tierCheckBytes-1) + "\r\nConnection: close\r\n\r\n"
 	if _, err := io.WriteString(tlsConn, request); err != nil {
+		failure = err
 		return tiered.CheckResult{Outcome: tiered.NoConnect}, true
 	}
 	reader := bufio.NewReaderSize(tlsConn, tierHeaderLine)
 	headerRoom := tierHeaderBytes
 	status, err := readHeaderLine(reader, &headerRoom)
 	if err != nil || !strings.HasPrefix(status, "HTTP/1.") {
+		failure = err
 		return tiered.CheckResult{Outcome: tiered.NoConnect}, true
 	}
 	latency := time.Since(start)
 	// the file itself or nothing: an error page, a redirect, a limit of requests is no transfer
 	// (whatever its size); the neutral check decides then (see Check)
-	if code := statusCode(status); code != 200 && code != 206 {
+	if code = statusCode(status); code != 200 && code != 206 {
 		return tiered.CheckResult{Outcome: tiered.NoConnect, Latency: latency}, true
 	}
 	watchdog.Reset(tierCheckStall)
@@ -821,6 +856,7 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) (res
 			return tiered.CheckResult{Outcome: tiered.NoConnect, Latency: latency}, true
 		}
 		if err != nil {
+			failure = err
 			return tiered.CheckResult{Outcome: tiered.Stall, Latency: latency}, true
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -837,8 +873,8 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) (res
 	if length >= 0 && length < want {
 		want = length
 	}
+	stage = "body"
 	buffer := make([]byte, 16<<10)
-	var got int64
 	bodyStart := time.Now()
 	for got < want {
 		conn.SetReadDeadline(minTime(time.Now().Add(tierCheckStall), start.Add(tierCheckTotal)))
@@ -851,6 +887,7 @@ func transferCheck(ctx context.Context, dialer N.Dialer, host, path string) (res
 			if errors.Is(err, io.EOF) && length < 0 {
 				break // the whole body, of a length not given
 			}
+			failure = err
 			if ctx.Err() != nil && !stalled.Load() && got >= freezeWindowEnd {
 				// still coming when the time was up, past where a freeze stops a transfer: slow
 				return tiered.CheckResult{Outcome: tiered.Slow, Latency: latency}, true
@@ -927,9 +964,13 @@ func minTime(a, b time.Time) time.Time {
 func (e *tierEnv) CheckPath(ctx context.Context, tag string) tiered.PathVerdict {
 	request := e.setup.pathRequestFor(tag)
 	if request == nil {
+		journalPathCheck(tag, nil, nil, tiered.PathUnknown)
 		return tiered.PathUnknown
 	}
-	return pathVerdictOf(DpiProbe(ctx, request).GetOutcome())
+	response := DpiProbe(ctx, request)
+	verdict := pathVerdictOf(response.GetOutcome())
+	journalPathCheck(tag, request, response, verdict)
+	return verdict
 }
 
 // pathRequestFor is the check of the path for the proxy tag, nil when there is none to make.

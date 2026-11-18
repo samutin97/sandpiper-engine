@@ -46,7 +46,9 @@ func startConnectivityWatcher() {
 		defer close(done)
 		static.watchConnectivity(ctx)
 	}()
-	// the choice by the server's ranking runs as long as this config does (tiered_runtime.go)
+	// the block journal of this config (journal_watch.go), then the choice by the server's ranking,
+	// as long as this config runs (tiered_runtime.go)
+	startJournalWatch()
 	startTieredRuntime()
 }
 
@@ -54,6 +56,7 @@ func startConnectivityWatcher() {
 // core that is stopping; static.lock must be held.
 func stopConnectivityWatcher() {
 	stopTieredRuntime()
+	stopJournalWatch()
 	if watcher.cancel == nil {
 		return
 	}

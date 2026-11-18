@@ -436,3 +436,22 @@ message DpiProbeResponse {
   repeated DpiProbeStage stages = 2;
   uint32 connections = 3;
 }
+
+// The journal of what stopped getting through (data/diag of the core's working directory, a ring of
+// JSON lines, about 5 MB): the checks of the proxies, the choices of the tiered group, the network,
+// the connections through the proxies and the handshakes to each server. Never the sites the user
+// visits, DNS questions, user IDs, links or passwords. Hardened fork.
+message BlockJournalRequest {
+  bool clear = 1;                     // delete the journal's files; it goes on from empty
+  bool export = 2;                    // zip the journal and the core's log for a block report
+  map<string, bytes> extra_files = 3; // more files for the zip, by name (app.log, another core's zip); text is scrubbed
+  bool inline = 4;                    // also return the zip's bytes (a core in another process)
+  string destination_path = 5;        // where to write the zip; empty is a file in the temp directory
+}
+
+message BlockJournalResponse {
+  string path = 1;     // the zip, when export was asked
+  bytes content = 2;   // its bytes, when inline was asked
+  int64 size = 3;      // bytes the journal holds now (after a clear: 0)
+  bool enabled = 4;    // the journal is written in this run (the block-journal setting, on unless false)
+}

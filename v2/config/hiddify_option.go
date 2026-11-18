@@ -96,6 +96,10 @@ type HiddifyOptions struct {
 	// with the host and path the checks use: the core then builds the tiered group and chooses in
 	// it (tier_group.go, hcore's tiered controller). The app sends it for the active profile only.
 	TierPolicy *TierPolicyOptions `json:"tier-policy,omitempty"`
+	// BlockJournal keeps the journal of what stopped getting through (hcore's journal.go: the
+	// checks of the proxies, the tiered group's choices, the network, the connections through the
+	// proxies and the handshakes to each server, never what the user visits), on unless false.
+	BlockJournal *bool `json:"block-journal,omitempty"`
 
 	DNSOptions
 	InboundOptions

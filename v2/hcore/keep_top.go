@@ -35,6 +35,8 @@ func buildRunningConfig(ctx context.Context, in *StartRequest) (*option.Options,
 		markEngineLeftovers(options)
 		// the tiered controller of this config starts with the connectivity watcher
 		noteTierPlan(static.HiddifyOptions, options, in.ConfigPath)
+		// and the block journal names its proxies
+		noteJournalProxies(options)
 	}
 	return options, err
 }
