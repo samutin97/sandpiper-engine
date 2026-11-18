@@ -71,7 +71,7 @@ func TestTierNeverLeftOnAnUnagreedLastResort(t *testing.T) {
 func TestTierUseRefusesAnUnagreedLastResort(t *testing.T) {
 	env := newFakeEnv(t)
 	c := started(t, env, nil)
-	c.use(c.indexOf(lastResort))
+	c.use(c.indexOf(lastResort), "walk")
 	if env.selected != held || c.State().Reason != ReasonConfirm {
 		t.Fatalf("selected %q, state %+v", env.selected, c.State())
 	}

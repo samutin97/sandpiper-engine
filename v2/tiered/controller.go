@@ -140,6 +140,35 @@ type netMemory struct {
 	Updated    time.Time `json:"at"`
 }
 
+// Note is a decision of the controller, as a journal of what stopped getting through records it
+// (Controller.OnNote): never an address or a name the user visits, only the policy's proxies.
+type Note struct {
+	Kind   string        // one of the Note* kinds
+	Tag    string        // the proxy it is about; "" for none
+	Server string        // that proxy's server (Candidate.Server)
+	Tier   int           // that proxy's tier, from 1; 0 for none
+	Mode   string        // that proxy's mode
+	From   string        // NoteUse: the proxy in use before, "" for none
+	Why    string        // what led to it (see the kinds)
+	Wait   time.Duration // NoteNone, NoteAsk, NoteSelect, NoteUpFailed: the next try in
+}
+
+// The kinds of Note.
+const (
+	NoteWalk     = "walk"          // a choice from the top starts; Why: the reason Evaluate was given, or retry
+	NoteMark     = "mark"          // Tag did not answer: tried after the others in this network for NodeDownTTL
+	NoteTCPOut   = "tcp_out"       // TCP to Server is out in this network (frozen or cut) for TransportDownTTL
+	NoteUse      = "use"           // Tag is chosen; Why: walk, up (the way up), same (the one in use, again)
+	NoteFailed   = "active_failed" // the proxy in use failed its data check; Why: its outcome
+	NoteAsk      = "ask"           // only the last resort Tag is left: the group held, the user asked
+	NoteAgree    = "agree"         // the user agreed to the last resort Tag
+	NoteNone     = "none"          // no proxy of the policy works: everything is tried again in Wait
+	NoteOffline  = "offline"       // no network: nothing is checked or marked
+	NoteIdle     = "idle"          // the user picked something else than the tiered group
+	NoteSelect   = "select_failed" // Tag could not be selected; tried again in Wait
+	NoteUpFailed = "up_failed"     // a turn of the way up found nothing; Wait: the next one in
+)
+
 // Controller chooses the proxy of the tiered group. State, NeedsConsent, Agree and Consent are safe
 // from any goroutine; the other methods are called from one (the core's loop, or a test), which
 // owns every field below but the two guarded by a lock.
@@ -150,6 +179,8 @@ type Controller struct {
 	// that called Agree: the core keeps the agreement for the rest of its run with this profile (a
 	// reload makes a new controller, see Consent).
 	OnConsent func(tag string)
+	// OnNote, when set, is told each decision, from the goroutine that made it (Agree's too).
+	OnNote func(Note)
 
 	env   Env
 	plan  *Plan // never changes
@@ -209,6 +240,7 @@ func (c *Controller) Agree(tag string) bool {
 	c.consentMu.Unlock()
 	if !already {
 		c.logf("the user agreed to %s", tag)
+		c.note(Note{Kind: NoteAgree, Tag: tag})
 		if c.OnConsent != nil {
 			c.OnConsent(tag)
 		}
@@ -235,6 +267,20 @@ func (c *Controller) setState(s State) {
 	}
 }
 
+// note tells OnNote of a decision (the server, tier and mode of its proxy filled in).
+func (c *Controller) note(n Note) {
+	if c.OnNote == nil {
+		return
+	}
+	if n.Tag != "" {
+		if i := c.indexOf(n.Tag); i >= 0 {
+			cand := c.plan.Candidates[i]
+			n.Server, n.Tier, n.Mode = cand.Server, cand.Tier+1, cand.Mode
+		}
+	}
+	c.OnNote(n)
+}
+
 func (c *Controller) logf(format string, args ...any) {
 	c.env.Log(fmt.Sprintf("tiers: "+format, args...))
 }
@@ -248,6 +294,7 @@ func (c *Controller) SetEnabled(ctx context.Context, enabled bool) {
 	c.enabled = enabled
 	if !enabled {
 		c.logf("idle: another choice is selected")
+		c.note(Note{Kind: NoteIdle})
 		c.setState(State{Tier: -1, Reason: ReasonIdle})
 		return
 	}
@@ -269,6 +316,7 @@ func (c *Controller) Evaluate(ctx context.Context, why string) {
 		return
 	}
 	c.logf("choosing (%s), network %s", why, c.network.ID)
+	c.note(Note{Kind: NoteWalk, Why: why})
 	c.walk(ctx, false)
 }
 
@@ -313,6 +361,7 @@ func (c *Controller) Confirm(ctx context.Context, tag string) bool {
 
 func (c *Controller) offline() {
 	c.logf("no network: waiting, nothing marked")
+	c.note(Note{Kind: NoteOffline})
 	s := c.State()
 	s.Reason, s.Checking, s.Network = ReasonOffline, false, ""
 	c.setState(s)
@@ -354,6 +403,7 @@ func (c *Controller) Tick(ctx context.Context) {
 	if c.active < 0 {
 		if r := c.State().Reason; (r == ReasonNone || r == ReasonConfirm) && !c.nextUp.IsZero() && !now.Before(c.nextUp) {
 			c.logf("trying again: nothing worked %s ago", c.noneWait)
+			c.note(Note{Kind: NoteWalk, Why: "retry"})
 			c.walk(ctx, true)
 		}
 		return
@@ -397,6 +447,7 @@ func (c *Controller) checkActive(ctx context.Context, now time.Time) bool {
 		return true
 	}
 	c.logf("%s in use: %s", cand.Tag, r.Outcome)
+	c.note(Note{Kind: NoteFailed, Tag: cand.Tag, Why: r.Outcome.String()})
 	switch c.confirmFailure(ctx, cand, r, 1) {
 	case verdictWorks:
 		c.nextCheck = c.env.Now().Add(c.plan.Params.Check)
@@ -476,6 +527,7 @@ func (c *Controller) tcpOutUntil(server string) time.Time {
 }
 
 func (c *Controller) markDown(tag string) {
+	c.note(Note{Kind: NoteMark, Tag: tag})
 	m := c.mem()
 	m.Down[tag] = c.env.Now().Add(NodeDownTTL)
 	m.Updated = c.env.Now()
@@ -571,7 +623,7 @@ func (c *Controller) walk(ctx context.Context, retry bool) {
 		}
 		switch c.try(ctx, w, i, attempts) {
 		case verdictWorks:
-			c.use(i)
+			c.use(i, "walk")
 			return
 		case verdictAborted:
 			return
@@ -592,7 +644,7 @@ func (c *Controller) walk(ctx context.Context, retry bool) {
 		c.logf("trying %s again although it failed here lately", c.plan.Candidates[i].Tag)
 		switch c.try(ctx, w, i, 1) {
 		case verdictWorks:
-			c.use(i)
+			c.use(i, "walk")
 			return
 		case verdictAborted:
 			return
@@ -614,6 +666,7 @@ func (c *Controller) walk(ctx context.Context, retry bool) {
 			c.nextUp = c.env.Now().Add(HeldMax)
 		}
 		c.logf("last resort %s waits for the user: no connection meanwhile; again in %s", cand.Tag, c.noneWait)
+		c.note(Note{Kind: NoteAsk, Tag: cand.Tag, Wait: c.noneWait})
 		c.setState(State{Tier: cand.Tier, Mode: cand.Mode, Reason: ReasonConfirm, Confirm: cand.Tag, Down: c.downTags(), Network: c.network.ID})
 		return
 	}
@@ -621,6 +674,7 @@ func (c *Controller) walk(ctx context.Context, retry bool) {
 	// while this walk ran is taken by the walk it starts)
 	c.waiting = ""
 	c.logf("no proxy of the policy works; again in %s", c.noneWait)
+	c.note(Note{Kind: NoteNone, Wait: c.noneWait})
 	c.setState(State{Tier: -1, Reason: ReasonNone, Down: c.downTags(), Network: c.network.ID})
 }
 
@@ -772,6 +826,7 @@ func (c *Controller) tcpOut(w *walkState, cand Candidate) {
 	if w != nil {
 		w.tcpOut[cand.Server] = true
 	}
+	c.note(Note{Kind: NoteTCPOut, Tag: cand.Tag})
 	c.markTCP(cand.Server)
 }
 
@@ -840,12 +895,13 @@ func (c *Controller) networkMoved() bool {
 	return !now.Online || now.ID != c.network.ID
 }
 
-// use selects candidate i.
-func (c *Controller) use(i int) {
+// use selects candidate i; why is what found it (walk, up).
+func (c *Controller) use(i int, why string) {
 	cand := c.plan.Candidates[i]
 	if c.needsConsent(cand) {
 		// the walk and the way up leave such a proxy out; the rule holds here as well
 		c.logf("%s waits for the user's agreement: not used", cand.Tag)
+		c.note(Note{Kind: NoteAsk, Tag: cand.Tag})
 		c.active, c.waiting = -1, cand.Tag
 		c.hold()
 		c.setState(State{Tier: cand.Tier, Mode: cand.Mode, Reason: ReasonConfirm, Confirm: cand.Tag, Down: c.downTags(), Network: c.network.ID})
@@ -856,6 +912,7 @@ func (c *Controller) use(i int) {
 		// works (a proxy still in use is checked again then; failing, a walk follows)
 		c.logf("select %s: %v; trying again later", cand.Tag, err)
 		c.scheduleNone()
+		c.note(Note{Kind: NoteSelect, Tag: cand.Tag, Wait: c.noneWait})
 		if c.active >= 0 {
 			c.nextCheck = c.nextUp
 			c.publish()
@@ -864,8 +921,14 @@ func (c *Controller) use(i int) {
 		}
 		return
 	}
+	from := ""
+	if c.active >= 0 {
+		from = c.plan.Candidates[c.active].Tag
+	}
 	if c.active != i {
 		c.since = c.env.Now()
+	} else {
+		why = "same"
 	}
 	c.active = i
 	c.waiting = ""
@@ -882,6 +945,7 @@ func (c *Controller) use(i int) {
 	}
 	c.clearMark(cand)
 	c.logf("using %s (tier %d, %s)", cand.Tag, cand.Tier+1, cand.Mode)
+	c.note(Note{Kind: NoteUse, Tag: cand.Tag, From: from, Why: why})
 	c.publish()
 }
 
@@ -944,7 +1008,7 @@ func (c *Controller) wayUp(ctx context.Context, limit int) {
 			c.logf("way up, second check of %s: %s", c.plan.Candidates[i].Tag, r.Outcome)
 			if r.Outcome.Works() {
 				c.slow = r.Outcome == Slow
-				c.use(i) // takes the mark of the proxy checked (only), and TCP's with a TCP one
+				c.use(i, "up") // takes the mark of the proxy checked (only), and TCP's with a TCP one
 				return
 			}
 			c.upFailed(now)
@@ -973,7 +1037,7 @@ func (c *Controller) wayUp(ctx context.Context, limit int) {
 		if nothing {
 			// nothing works now: one pass is enough
 			c.slow = r.Outcome == Slow
-			c.use(i)
+			c.use(i, "up")
 			return
 		}
 		c.upPassed = cand.Tag
@@ -996,6 +1060,7 @@ func (c *Controller) upFailed(now time.Time) {
 		c.upWait = LastResortRetry
 	}
 	c.nextUp = c.env.Now().Add(c.upWait)
+	c.note(Note{Kind: NoteUpFailed, Tag: cand.Tag, Wait: c.upWait})
 }
 
 func (c *Controller) indexOf(tag string) int {
