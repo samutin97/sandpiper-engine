@@ -217,11 +217,13 @@ func TestKeepTopNeverMakesChainHopsLazy(t *testing.T) {
 }
 
 // A profile with no more proxies than keep top keeps has none to rest: nothing in it is lazy, so
-// nothing sleeps. With one more than the count, all of them are lazy again.
+// nothing sleeps. With one more than the count, all of them are lazy again. keep-top -1 (all, as a
+// subscription's keep-top header may say) turns it off whatever the count: the way a server turns
+// keep top off on the clients it serves (only the user's own choice for the profile wins).
 func TestKeepTopOffWhenTheProfileHasNoMoreProxiesThanItKeeps(t *testing.T) {
 	for _, tc := range []struct {
 		keepTop, managed int
-	}{{5, 0}, {6, 0}, {100, 0}, {4, 0}, {3, 4}} { // hardened: 4 candidates, wg is not one
+	}{{5, 0}, {6, 0}, {100, 0}, {4, 0}, {3, 4}, {-1, 0}} { // hardened: 4 candidates, wg is not one
 		ctx := libbox.BaseContext(nil)
 		input, err := ReadSingOptions(ctx, &ReadOptions{Content: keepTopEndpointsProfile})
 		if err != nil {
