@@ -1051,6 +1051,7 @@ Define the message equivalent of SetupParameters
 | downlink_total | [int64](#int64) |  |  |
 | current_outbound | [string](#string) |  |  |
 | current_profile | [string](#string) |  |  |
+| tier_confirm | [string](#string) |  | The last-resort proxy (a tag) the choice by the server&#39;s ranking waits for the user&#39;s agreement to, the tiered group held meanwhile (no connection); &#34;&#34; when it waits for none. Read by the Android service for its notification, which works without the app&#39;s UI. |
 
 
 

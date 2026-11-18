@@ -62,6 +62,7 @@ func (h *HiddifyInstance) readStatus(prev *SystemInfo) *SystemInfo {
 		// Always the profile of the current start: the previous cache kept the old name
 		// after a profile switch once more than 1 MB had been sent.
 		message.CurrentProfile = CurrentProfileName()
+		message.TierConfirm = tierWaiting()
 		if message.CurrentProfile == "" {
 			settings := db.GetTable[hcommon.AppSettings]()
 			if lastName, err := settings.Get("lastStartRequestName"); err == nil {

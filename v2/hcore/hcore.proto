@@ -106,6 +106,10 @@ message SystemInfo {
   int64 downlink_total = 9;
   string current_outbound = 10;
   string current_profile = 11;
+  // The last-resort proxy (a tag) the choice by the server's ranking waits for the user's agreement
+  // to, the tiered group held meanwhile (no connection); "" when it waits for none. Read by the
+  // Android service for its notification, which works without the app's UI.
+  string tier_confirm = 12;
 }
 
 // Connection state of an outbound or endpoint (mirrors adapter.Status).
