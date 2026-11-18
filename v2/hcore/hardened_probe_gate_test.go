@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hiddify/hiddify-core/v2/config"
 	"github.com/hiddify/hiddify-core/v2/tiered"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/log"
@@ -124,5 +125,41 @@ func TestDpiProbeDialsTheProxyAddressWithTheName(t *testing.T) {
 	r := DpiProbe(context.Background(), &DpiProbeRequest{Host: host, Port: port, ServerName: "example.com", Insecure: true, TimeoutMs: 3000})
 	if r.Outcome != "ok" || sni != "example.com" || hostHeader != "example.com" {
 		t.Fatalf("%s: SNI %q, Host %q", r.Outcome, sni, hostHeader)
+	}
+}
+
+// 5.9.8-sp.11: the check of the path for a proxy goes to its own server, with a name in TLS that
+// server answers to: the second server of a subscription is checked by its address and name, not by
+// the subscription's. A server without such a name is not checked; a proxy whose server is not known
+// checks the subscription's host, as before.
+func TestDpiProbePathOfEachServer(t *testing.T) {
+	setup := &tierSetup{host: "sub.example.net", path: "/files/sample.bin", probeAddress: "192.0.2.10",
+		pathTargets: map[string]config.TierPathTarget{
+			"2 gRPC":       {Dial: "192.0.2.10", ServerName: "vpn.example.net"},
+			"12 gRPC":      {Dial: "198.51.100.20", ServerName: "vpn2.example.com"},
+			"17 Reality C": {Dial: "203.0.113.30"},
+		}}
+	for tag, want := range map[string]*DpiProbeRequest{
+		"2 gRPC":       {Host: "192.0.2.10", ServerName: "vpn.example.net"},
+		"12 gRPC":      {Host: "198.51.100.20", ServerName: "vpn2.example.com"},
+		"17 Reality C": nil,
+		"8 unknown":    {Host: "192.0.2.10", ServerName: "sub.example.net"},
+	} {
+		got := setup.pathRequestFor(tag)
+		if want == nil {
+			if got != nil {
+				t.Fatalf("%s: %+v, want no check", tag, got)
+			}
+			continue
+		}
+		if got == nil || got.Host != want.Host || got.ServerName != want.ServerName || got.Path != "/files/sample.bin" || got.Insecure {
+			t.Fatalf("%s: %+v, want %+v", tag, got, want)
+		}
+	}
+	if (&tierSetup{host: "sub.example.net"}).pathRequestFor("2 gRPC") != nil {
+		t.Fatal("a check without the probe path")
+	}
+	if (&tierEnv{setup: &tierSetup{}}).CheckPath(context.Background(), "2 gRPC") != tiered.PathUnknown {
+		t.Fatal("a verdict without a check")
 	}
 }

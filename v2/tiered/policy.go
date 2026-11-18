@@ -502,12 +502,16 @@ func Resolve(ref Ref, tags []string) string {
 
 // Candidate is a proxy of the profile in the order the controller tries them.
 type Candidate struct {
-	Tag      string
-	Tier     int // index of its tier in the policy
-	Mode     string
-	Confirm  bool
-	Max      time.Duration
-	UDP      bool
+	Tag     string
+	Tier    int // index of its tier in the policy
+	Mode    string
+	Confirm bool
+	Max     time.Duration
+	UDP     bool
+	// Server is the server the proxy connects to: its address as the handshake gate counts it (an
+	// address or a subnet), or its domain; "" when not known. TCP to one server being out says
+	// nothing of another's.
+	Server   string
 	Scores   Scores
 	Scored   bool
 	Order    int // its place in the tier as the policy lists it
@@ -605,6 +609,17 @@ func (p *Policy) Bind(tags []string, udp func(tag string) bool) *Plan {
 		}
 	}
 	return plan
+}
+
+// SetServers gives each candidate the server it connects to (Candidate.Server); server answers ""
+// when it does not know.
+func (p *Plan) SetServers(server func(tag string) string) {
+	if p == nil || server == nil {
+		return
+	}
+	for i := range p.Candidates {
+		p.Candidates[i].Server = server(p.Candidates[i].Tag)
+	}
 }
 
 // Reserves are the last resorts that wait for the user's agreement: nothing may use or even test

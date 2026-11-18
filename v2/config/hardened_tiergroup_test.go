@@ -320,3 +320,88 @@ func TestTierProbeAddress(t *testing.T) {
 		}
 	}
 }
+
+// twoServerSubscription: proxies of two servers in one subscription (A 1-7, B 11-17), each with a
+// TLS name of its own and REALITY proxies borrowing another site's name, and a third server with
+// REALITY alone.
+const twoServerSubscription = `{"outbounds":[
+ {"type":"vless","tag":"2 gRPC","server":"192.0.2.10","server_port":443,"uuid":"00000000-0000-4000-8000-000000000001",
+  "tls":{"enabled":true,"server_name":"vpn.example.net","alpn":["h2"]},"transport":{"type":"grpc","service_name":"svc-a"}},
+ {"type":"vless","tag":"3 XHTTP","server":"192.0.2.10","server_port":443,"uuid":"00000000-0000-4000-8000-000000000001",
+  "tls":{"enabled":true,"server_name":"vpn.example.net","alpn":["h2"]},"transport":{"type":"xhttp","mode":"auto","path":"/x3"}},
+ {"type":"vless","tag":"6 Reality gRPC","server":"192.0.2.10","server_port":8443,"uuid":"00000000-0000-4000-8000-000000000002",
+  "tls":{"enabled":true,"server_name":"www.example.org","utls":{"enabled":true,"fingerprint":"chrome"},
+   "reality":{"enabled":true,"public_key":"jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0","short_id":"0123abcd"}},
+  "transport":{"type":"grpc","service_name":"svc-r"}},
+ {"type":"vless","tag":"12 gRPC","server":"198.51.100.20","server_port":443,"uuid":"00000000-0000-4000-8000-000000000003",
+  "tls":{"enabled":true,"server_name":"vpn2.example.com","alpn":["h2"]},"transport":{"type":"grpc","service_name":"svc-b"}},
+ {"type":"vless","tag":"13 XHTTP","server":"198.51.100.20","server_port":443,"uuid":"00000000-0000-4000-8000-000000000003",
+  "tls":{"enabled":true,"server_name":"vpn2.example.com","alpn":["h2"]},"transport":{"type":"xhttp","mode":"auto","path":"/x13"}},
+ {"type":"vless","tag":"16 Reality gRPC","server":"198.51.100.20","server_port":8443,"uuid":"00000000-0000-4000-8000-000000000004",
+  "tls":{"enabled":true,"server_name":"www.example.org","utls":{"enabled":true,"fingerprint":"chrome"},
+   "reality":{"enabled":true,"public_key":"jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0","short_id":"0123abcd"}},
+  "transport":{"type":"grpc","service_name":"svc-r2"}},
+ {"type":"vless","tag":"17 Reality C","server":"203.0.113.30","server_port":443,"uuid":"00000000-0000-4000-8000-000000000005",
+  "tls":{"enabled":true,"server_name":"www.example.org","utls":{"enabled":true,"fingerprint":"chrome"},
+   "reality":{"enabled":true,"public_key":"jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0","short_id":"0123abcd"}},
+  "transport":{"type":"grpc","service_name":"svc-c"}},
+ {"type":"direct","tag":"direct"}
+]}`
+
+// 5.9.8-sp.11: each proxy knows its server (the handshake gate's key), and the check of the path
+// for a proxy goes to its server, with a name in TLS that server answers to.
+func TestTierServersAndPathTargets(t *testing.T) {
+	const policy = "v=1;t=auto:2,3;t=auto:12,13;t=fallback:6,16,17"
+	options := buildPanelProfile(t, twoServerSubscription, tierSettings(t, policy))
+	plan := TierPlan(options, chainTestOptions(t, tierSettings(t, policy)))
+	if plan == nil {
+		t.Fatal("no plan")
+	}
+	servers := map[string]string{}
+	for _, cand := range plan.Candidates {
+		servers[cand.Tag] = cand.Server
+	}
+	for tag, want := range map[string]string{
+		"2 gRPC": "192.0.2.10/32", "3 XHTTP": "192.0.2.10/32", "6 Reality gRPC": "192.0.2.10/32",
+		"12 gRPC": "198.51.100.20/32", "13 XHTTP": "198.51.100.20/32", "16 Reality gRPC": "198.51.100.20/32",
+		"17 Reality C": "203.0.113.30/32",
+	} {
+		if servers[tag] != want {
+			t.Errorf("%s: server %q, want %q", tag, servers[tag], want)
+		}
+	}
+	probe := TierProbeAddress(options, plan, "vpn.example.net")
+	targets := TierPathTargets(options, plan, "vpn.example.net", probe)
+	for tag, want := range map[string]TierPathTarget{
+		"2 gRPC":          {Dial: "192.0.2.10", ServerName: "vpn.example.net"},
+		"6 Reality gRPC":  {Dial: "192.0.2.10", ServerName: "vpn.example.net"}, // the name of a TLS proxy on its server
+		"12 gRPC":         {Dial: "198.51.100.20", ServerName: "vpn2.example.com"},
+		"16 Reality gRPC": {Dial: "198.51.100.20", ServerName: "vpn2.example.com"},
+		"17 Reality C":    {Dial: "203.0.113.30"}, // no name the server answers to is known: no check
+	} {
+		if got := targets[tag]; got != want {
+			t.Errorf("%s: %+v, want %+v", tag, got, want)
+		}
+	}
+	// a server the subscription's host is on (its address) gets that host when nothing names it
+	if got := TierPathTargets(options, plan, "sub.example.net", "203.0.113.30")["17 Reality C"]; got.ServerName != "sub.example.net" {
+		t.Errorf("the subscription's server: %+v", got)
+	}
+}
+
+func TestTierServerKeys(t *testing.T) {
+	for server, want := range map[string]string{
+		"192.0.2.10": "192.0.2.10/32", "::ffff:192.0.2.10": "192.0.2.10/32", "2001:db8::1": "2001:db8::1/128",
+		"VPN.Example.net.": "vpn.example.net", "": "",
+	} {
+		if got := tierServer(server); got != want {
+			t.Errorf("%q: %q, want %q", server, got, want)
+		}
+	}
+	if got := tierServerOf(&option.WireGuardEndpointOptions{Peers: []option.WireGuardPeer{{Address: "192.0.2.10"}}}); got != "192.0.2.10" {
+		t.Errorf("wireguard: %q", got)
+	}
+	if got := tierServerOf(&option.AwgEndpointOptions{Peers: []option.AwgPeerOptions{{Address: "198.51.100.20"}}}); got != "198.51.100.20" {
+		t.Errorf("awg: %q", got)
+	}
+}

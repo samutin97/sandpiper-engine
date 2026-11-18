@@ -203,6 +203,8 @@ func TierPlan(options *option.Options, hopt *HiddifyOptions) *tiered.Plan {
 	if plan == nil || !slices.Equal(append(plan.Tags(), OutboundTieredWaitTag), members) {
 		return nil
 	}
+	servers := tierServers(options)
+	plan.SetServers(func(tag string) string { return servers[tag] })
 	return plan
 }
 
@@ -258,4 +260,115 @@ func TierProbeAddress(options *option.Options, plan *tiered.Plan, host string) s
 		return addr.Unmap().String()
 	}
 	return ""
+}
+
+// tierServer is the key of a server as the handshake gate counts it (common/tls: the address, one
+// address a key unless the gate is told of subnets, which the core does not): an IP address as
+// address/32 or /128, a domain in lower case; "" for none.
+func tierServer(server string) string {
+	if addr, err := netip.ParseAddr(server); err == nil {
+		addr = addr.Unmap()
+		return netip.PrefixFrom(addr, addr.BitLen()).String()
+	}
+	return strings.ToLower(strings.TrimSuffix(server, "."))
+}
+
+// tierServerOf is the server an outbound or endpoint connects to, as written in its options (an
+// address or a domain); "" when it has none (a group, direct, an endpoint without a peer).
+func tierServerOf(options any) string {
+	switch o := options.(type) {
+	case option.ServerOptionsWrapper:
+		return o.TakeServerOptions().Server
+	case *option.WireGuardEndpointOptions:
+		if len(o.Peers) > 0 {
+			return o.Peers[0].Address
+		}
+	case *option.AwgEndpointOptions:
+		if len(o.Peers) > 0 {
+			return o.Peers[0].Address
+		}
+	}
+	return ""
+}
+
+// tierServers are the servers (tierServer) of the outbounds and endpoints of options, by tag.
+func tierServers(options *option.Options) map[string]string {
+	servers := map[string]string{}
+	for _, out := range options.Outbounds {
+		if server := tierServerOf(out.Options); server != "" {
+			servers[out.Tag] = tierServer(server)
+		}
+	}
+	for _, end := range options.Endpoints {
+		if server := tierServerOf(end.Options); server != "" {
+			servers[end.Tag] = tierServer(server)
+		}
+	}
+	return servers
+}
+
+// TierPathTarget is where the check of the path to a proxy's server goes, outside the tunnel: Dial,
+// the server's address (or domain) as the proxy's options write it, and ServerName, a name in TLS
+// that server answers to with the site of the subscription's probe path. ServerName "" when no such
+// name is known: the path to that server is not checked.
+type TierPathTarget struct {
+	Dial       string
+	ServerName string
+}
+
+// TierPathTargets are the targets of the check of the path for plan's proxies, by tag (a proxy
+// without a server is left out: its check goes to the subscription's host, as before servers were
+// told apart). The name in TLS is the proxy's own server name when it is a TLS proxy other than
+// REALITY; else that of the first such proxy of plan on the same server (a REALITY proxy borrows a
+// foreign site's name, which the server does not serve); else host, the subscription's, when the
+// server is the one probeAddress names (config.TierProbeAddress); else none. UDP proxies get one
+// too, unused: only a TCP proxy's failure asks about the path.
+func TierPathTargets(options *option.Options, plan *tiered.Plan, host, probeAddress string) map[string]TierPathTarget {
+	if options == nil || plan == nil {
+		return nil
+	}
+	outbounds := map[string]any{}
+	for _, out := range options.Outbounds {
+		outbounds[out.Tag] = out.Options
+	}
+	for _, end := range options.Endpoints {
+		outbounds[end.Tag] = end.Options
+	}
+	ownName := func(opts any) string {
+		wrapper, ok := opts.(option.OutboundTLSOptionsWrapper)
+		if !ok {
+			return ""
+		}
+		tls := wrapper.TakeOutboundTLSOptions()
+		if tls == nil || !tls.Enabled || (tls.Reality != nil && tls.Reality.Enabled) {
+			return ""
+		}
+		return tls.ServerName
+	}
+	byServer := map[string]string{}
+	for _, cand := range plan.Candidates {
+		if name := ownName(outbounds[cand.Tag]); name != "" && cand.Server != "" && byServer[cand.Server] == "" {
+			byServer[cand.Server] = name
+		}
+	}
+	subscription := ""
+	if probeAddress != "" {
+		subscription = tierServer(probeAddress)
+	}
+	targets := map[string]TierPathTarget{}
+	for _, cand := range plan.Candidates {
+		dial := tierServerOf(outbounds[cand.Tag])
+		if cand.Server == "" || dial == "" {
+			continue
+		}
+		name := ownName(outbounds[cand.Tag])
+		if name == "" {
+			name = byServer[cand.Server]
+		}
+		if name == "" && cand.Server == subscription {
+			name = host
+		}
+		targets[cand.Tag] = TierPathTarget{Dial: dial, ServerName: name}
+	}
+	return targets
 }

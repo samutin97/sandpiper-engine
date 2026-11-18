@@ -37,7 +37,8 @@ import (
 // (config.TierPlan): from the start or a hot reload until the next one or the stop, beside the
 // connectivity watcher. It acts only while select has the tiered group selected; the user's own
 // pick in select stops it. Its checks: a transfer of 64 KiB through the proxy checked (to the
-// subscription's host and test path, never another host), and DpiProbe to that host directly.
+// subscription's host and test path, never another host), and DpiProbe directly to the server of a
+// TCP proxy that failed (its address, a name in TLS it answers to, the same test path).
 
 // Limits of a check through a proxy.
 const (
@@ -63,6 +64,9 @@ type tierSetup struct {
 	// probeAddress is the IP address the check of the path dials for host, "" to dial the name
 	// (config.TierProbeAddress)
 	probeAddress string
+	// pathTargets is where the check of the path goes for each proxy: its server, and a name in TLS
+	// that server answers to (config.TierPathTargets); a proxy not in it gets the subscription's host
+	pathTargets map[string]config.TierPathTarget
 	// consentKeys name the user's agreement to each last resort that asks for one (and only those):
 	// the profile, its policy and the proxy itself (its options). An agreement holds for that proxy
 	// of that profile, in this run of the core: another profile with a proxy of the same tag, a new
@@ -89,6 +93,7 @@ func noteTierPlan(hopt *config.HiddifyOptions, opts *option.Options, profilePath
 			setup.path = tp.ProbePath
 		}
 		setup.probeAddress = config.TierProbeAddress(opts, plan, setup.host)
+		setup.pathTargets = config.TierPathTargets(opts, plan, setup.host, setup.probeAddress)
 	}
 	setup.consentKeys = tierConsentKeys(plan, profilePath, hopt.TierPolicy.Policy, profileFingerprints(profilePath))
 	pendingTierPlan.Store(setup)
@@ -909,13 +914,32 @@ func minTime(a, b time.Time) time.Time {
 	return b
 }
 
-// CheckPath runs DpiProbe to the subscription's host, the download only, one connection: TCP to
-// the server freezing or cut makes every TCP proxy useless here.
-func (e *tierEnv) CheckPath(ctx context.Context) tiered.PathVerdict {
-	if e.setup.host == "" || e.setup.path == "" {
+// CheckPath runs DpiProbe to the server of the proxy tag, the download only, one connection: TCP to
+// that server freezing or cut makes its TCP proxies useless here (and no other server's). The probe
+// dials the server's address with a name in TLS it answers to, and the subscription's probe path; a
+// server without such a name is not checked (the controller then goes by what the proxies' checks
+// found), a proxy whose server is not known checks the subscription's host, as before.
+func (e *tierEnv) CheckPath(ctx context.Context, tag string) tiered.PathVerdict {
+	request := e.setup.pathRequestFor(tag)
+	if request == nil {
 		return tiered.PathUnknown
 	}
-	return pathVerdictOf(DpiProbe(ctx, e.setup.pathRequest()).GetOutcome())
+	return pathVerdictOf(DpiProbe(ctx, request).GetOutcome())
+}
+
+// pathRequestFor is the check of the path for the proxy tag, nil when there is none to make.
+func (s *tierSetup) pathRequestFor(tag string) *DpiProbeRequest {
+	if s.host == "" || s.path == "" {
+		return nil
+	}
+	target, ok := s.pathTargets[tag]
+	if !ok {
+		return s.pathRequest()
+	}
+	if target.ServerName == "" {
+		return nil
+	}
+	return &DpiProbeRequest{Host: target.Dial, ServerName: target.ServerName, Path: s.path, Attempts: 1, TimeoutMs: 5000}
 }
 
 // pathRequest is the check of the path: the subscription's host by the address of a proxy on it when

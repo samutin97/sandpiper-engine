@@ -21,8 +21,11 @@ type fakeEnv struct {
 	selected string
 	selects  []string
 	// script answers a check of tag at the current time
-	script     func(tag string, now time.Time) (Outcome, time.Duration)
-	path       func(now time.Time) (PathVerdict, time.Duration)
+	script func(tag string, now time.Time) (Outcome, time.Duration)
+	path   func(now time.Time) (PathVerdict, time.Duration)
+	// pathOf, when set, answers a check of the path for the proxy tag (its server) instead of path
+	pathOf     func(tag string, now time.Time) (PathVerdict, time.Duration)
+	paths      []string // the proxies the path was checked for, in order
 	checks     []string // every proxy checked, in order
 	handshakes int      // TLS or QUIC handshakes with the server: one per check of a proxy or of the path
 	// picked says whether the tiered group is still the user's pick; nil: always
@@ -60,8 +63,14 @@ func (e *fakeEnv) Check(_ context.Context, tag string) CheckResult {
 	e.now = e.now.Add(took)
 	return CheckResult{Outcome: outcome, Latency: took / 2}
 }
-func (e *fakeEnv) CheckPath(context.Context) PathVerdict {
+func (e *fakeEnv) CheckPath(_ context.Context, tag string) PathVerdict {
 	e.handshakes++
+	e.paths = append(e.paths, tag)
+	if e.pathOf != nil {
+		v, took := e.pathOf(tag, e.now)
+		e.now = e.now.Add(took)
+		return v
+	}
 	v, took := e.path(e.now)
 	e.now = e.now.Add(took)
 	return v
