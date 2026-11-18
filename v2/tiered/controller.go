@@ -66,6 +66,9 @@ type Env interface {
 	Hold() error
 	// Picked: the tiered group is still the user's pick; a walk stops once it is not.
 	Picked() bool
+	// Received is how many bytes the apps' connections through the proxy tag have brought so far:
+	// a counter that only grows (it starts again with a new run of the engine).
+	Received(tag string) int64
 	Network() Network
 	Log(message string)
 }
@@ -89,6 +92,7 @@ const (
 	NoneFirst        = time.Minute      // nothing works: the first wait before trying again
 	NoneMax          = 15 * time.Minute // nothing works: the longest wait
 	HeldMax          = 5 * time.Minute  // the group held for the user's agreement: the longest wait
+	CarriedEnough    = 256 << 10        // bytes the apps got through the proxy in use that stand for its data check
 	maxNetworks      = 16
 	upChecksPerTurn  = 2 // checks of the proxies above in one turn of the way up
 )
@@ -159,6 +163,9 @@ type Controller struct {
 	since   time.Time
 	slow    bool
 	waiting string // the last resort offered to the user, while the group is held for it
+
+	received   int64 // Received of the proxy in use at its last check (or its selection)
+	forceCheck bool  // the next data check is made whatever the proxy carried (a sign it fails)
 
 	nextCheck time.Time // the active proxy's data check
 	nextUp    time.Time // the next turn of the way up
@@ -275,6 +282,7 @@ func (c *Controller) NetworkChanged(ctx context.Context) {
 	default:
 		// the same network again: a quick look at the proxy in use
 		c.nextCheck = c.env.Now().Add(5 * time.Second)
+		c.forceCheck = true
 	}
 }
 
@@ -284,6 +292,7 @@ func (c *Controller) ActiveFailed(ctx context.Context) {
 		return
 	}
 	c.nextCheck = c.env.Now()
+	c.forceCheck = true
 	c.Tick(ctx)
 }
 
@@ -344,35 +353,54 @@ func (c *Controller) Tick(ctx context.Context) {
 		}
 		return
 	}
-	if !now.Before(c.nextCheck) {
-		cand := c.plan.Candidates[c.active]
-		c.checking(true)
-		r := c.env.Check(ctx, cand.Tag)
-		c.checking(false)
-		if ctx.Err() != nil {
-			return
-		}
-		if r.Outcome.Works() {
-			c.slow = r.Outcome == Slow
-			c.clearMark(cand)
-			c.nextCheck = c.env.Now().Add(c.plan.Params.Check)
-			c.publish()
-		} else {
-			c.logf("%s in use: %s", cand.Tag, r.Outcome)
-			switch c.confirmFailure(ctx, cand, r, 1) {
-			case verdictWorks:
-				c.nextCheck = c.env.Now().Add(c.plan.Params.Check)
-				c.publish()
-			case verdictAborted:
-			default:
-				c.walk(ctx, false)
-			}
-			return
-		}
+	if !now.Before(c.nextCheck) && !c.checkActive(ctx, now) {
+		return
 	}
 	if c.active > 0 && !c.nextUp.IsZero() && !c.env.Now().Before(c.nextUp) {
 		c.wayUp(ctx, c.active)
 	}
+}
+
+// checkActive is the data check of the proxy in use; false when it failed and Tick has nothing
+// more to do (a walk or the network took over).
+func (c *Controller) checkActive(ctx context.Context, now time.Time) bool {
+	cand := c.plan.Candidates[c.active]
+	received := c.env.Received(cand.Tag)
+	if !c.forceCheck && received-c.received >= CarriedEnough {
+		// the apps' data came through it since the last check, and nothing says it fails: that
+		// stands for the check (no 64 KiB of its own); the next one in chk, as after a check
+		c.logf("%s carried %d KiB since its last check: no check needed", cand.Tag, (received-c.received)>>10)
+		c.received = received
+		c.clearMark(cand)
+		c.nextCheck = now.Add(c.plan.Params.Check)
+		c.publish()
+		return true
+	}
+	c.forceCheck = false
+	c.checking(true)
+	r := c.env.Check(ctx, cand.Tag)
+	c.checking(false)
+	if ctx.Err() != nil {
+		return false
+	}
+	c.received = c.env.Received(cand.Tag)
+	if r.Outcome.Works() {
+		c.slow = r.Outcome == Slow
+		c.clearMark(cand)
+		c.nextCheck = c.env.Now().Add(c.plan.Params.Check)
+		c.publish()
+		return true
+	}
+	c.logf("%s in use: %s", cand.Tag, r.Outcome)
+	switch c.confirmFailure(ctx, cand, r, 1) {
+	case verdictWorks:
+		c.nextCheck = c.env.Now().Add(c.plan.Params.Check)
+		c.publish()
+	case verdictAborted:
+	default:
+		c.walk(ctx, false)
+	}
+	return false
 }
 
 type verdict int
@@ -778,6 +806,8 @@ func (c *Controller) use(i int) {
 	c.active = i
 	c.waiting = ""
 	c.noneWait = 0
+	c.received = c.env.Received(cand.Tag)
+	c.forceCheck = false
 	c.upPassed = ""
 	c.upCursor = 0
 	c.upWait = c.plan.Params.Up

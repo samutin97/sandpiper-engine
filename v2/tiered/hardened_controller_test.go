@@ -27,8 +27,10 @@ type fakeEnv struct {
 	handshakes int      // TLS or QUIC handshakes with the server: one per check of a proxy or of the path
 	// picked says whether the tiered group is still the user's pick; nil: always
 	picked func() bool
-	logMu  sync.Mutex
-	log    []string
+	// received is what Received answers; nil: nothing came through any proxy
+	received func(tag string) int64
+	logMu    sync.Mutex
+	log      []string
 }
 
 // held is what selected says while the group is held on no proxy.
@@ -74,7 +76,13 @@ func (e *fakeEnv) Hold() error {
 	e.selects = append(e.selects, held)
 	return nil
 }
-func (e *fakeEnv) Picked() bool     { return e.picked == nil || e.picked() }
+func (e *fakeEnv) Picked() bool { return e.picked == nil || e.picked() }
+func (e *fakeEnv) Received(tag string) int64 {
+	if e.received == nil {
+		return 0
+	}
+	return e.received(tag)
+}
 func (e *fakeEnv) Network() Network { return e.network }
 func (e *fakeEnv) Log(m string) {
 	e.logMu.Lock()

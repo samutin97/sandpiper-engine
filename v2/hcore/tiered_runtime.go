@@ -418,6 +418,18 @@ func tierState() string {
 	return ctl.State().JSON()
 }
 
+// tierWaiting is the last-resort proxy the controller waits for the user's agreement to (the tiered
+// group held), "" when it waits for none or does not run (SystemInfo.tier_confirm).
+func tierWaiting() string {
+	tierRun.Lock()
+	ctl := tierRun.ctl
+	tierRun.Unlock()
+	if ctl == nil {
+		return ""
+	}
+	return ctl.State().Confirm
+}
+
 // tierConfirm is the user's agreement to a last-resort proxy: kept at once (whatever the controller
 // does now, a later try included), then the controller chooses again in its loop (one pending
 // choice covers several taps).
@@ -585,6 +597,10 @@ func (e *tierEnv) Select(tag string) error {
 func (e *tierEnv) Hold() error { return e.Select(config.OutboundTieredWaitTag) }
 
 func (e *tierEnv) Picked() bool { return e.tieredSelected() }
+
+// Received is what the apps' connections through the proxy brought back (the core's own checks do
+// not go through the router, so they do not count).
+func (e *tierEnv) Received(tag string) int64 { return outboundDown(tag) }
 
 // activeTag is the proxy the tiered group uses while it is the user's pick, else "".
 func (e *tierEnv) activeTag() string {

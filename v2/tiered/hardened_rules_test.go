@@ -454,3 +454,56 @@ func (f *failingSelect) Select(tag string) error {
 	}
 	return f.fakeEnv.Select(tag)
 }
+
+// The proxy in use carries the apps' data: that stands for its data check (no 64 KiB of its own);
+// with too little data, or once something says it fails, the check is made as before.
+func TestTierDataCarriedStandsForTheCheck(t *testing.T) {
+	env := newFakeEnv(t)
+	var carried int64
+	env.received = func(tag string) int64 {
+		if tag == "2 Bravo gRPC" {
+			return carried
+		}
+		return 0
+	}
+	c := started(t, env, nil)
+	if env.selected != "2 Bravo gRPC" {
+		t.Fatalf("selected %q", env.selected)
+	}
+	checks := func() int {
+		n := 0
+		for _, tag := range env.checks {
+			if tag == "2 Bravo gRPC" {
+				n++
+			}
+		}
+		return n
+	}
+	first := checks()
+	// an hour of browsing: 1 MiB every 10 min, no check
+	for range 6 {
+		carried += 1 << 20
+		env.runFor(context.Background(), c, 10*time.Minute)
+	}
+	if n := checks() - first; n != 0 {
+		t.Fatalf("%d checks while it carried data", n)
+	}
+	// little data (less than CarriedEnough): checked again, every chk
+	carried += 10 << 10
+	env.runFor(context.Background(), c, 10*time.Minute+time.Second)
+	if n := checks() - first; n != 1 {
+		t.Fatalf("%d checks with little data", n)
+	}
+	// a sign it fails (the monitoring, the apps' connections): checked at once, data or not
+	carried += 4 << 20
+	c.ActiveFailed(context.Background())
+	if n := checks() - first; n != 2 {
+		t.Fatalf("%d checks after a sign of failure", n)
+	}
+	// a counter that starts again (a new run of the engine) is no data
+	carried = 0
+	env.runFor(context.Background(), c, 10*time.Minute+time.Second)
+	if n := checks() - first; n != 3 {
+		t.Fatalf("%d checks after the counter started again", n)
+	}
+}
