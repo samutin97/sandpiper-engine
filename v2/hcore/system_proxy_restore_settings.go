@@ -10,7 +10,9 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
-// restoreSystemProxy turns the system proxy off, as the inbound that set it does when it closes.
+// restoreSystemProxy turns the system proxy off, as the inbound that set it does when it closes. On
+// Windows only while it is on and still points at address: another program that took it since
+// keeps it (the fork's settings package decides, for a Disable without an Enable).
 func restoreSystemProxy(address string) error {
 	server := M.ParseSocksaddr(address)
 	if !server.IsValid() {
