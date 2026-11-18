@@ -988,7 +988,8 @@ func (tierStore) Save(data []byte) {
 }
 
 // tieredConnectivity: with the tiered group in use, a working ping of the proxy it selected is a
-// working connection, whatever lowest's pings say.
+// working connection, whatever lowest's pings say; so is the controller's choice of it, until the
+// monitoring has a result for it (tierChoiceStands).
 func tieredConnectivity(histories map[string]*adapter.URLTestHistory) bool {
 	env := &tierEnv{}
 	if !env.tieredSelected() {
@@ -998,5 +999,35 @@ func tieredConnectivity(histories map[string]*adapter.URLTestHistory) bool {
 	if sel == nil {
 		return false
 	}
-	return pingAlive(historyDelay(histories[groupNow(sel)]))
+	tag := groupNow(sel)
+	if pingAlive(historyDelay(histories[tag])) {
+		return true
+	}
+	tierRun.Lock()
+	ctl := tierRun.ctl
+	tierRun.Unlock()
+	if ctl == nil {
+		return false
+	}
+	return tierChoiceStands(ctl.State(), tag, histories[tag])
+}
+
+// tierChoiceStands: the controller chose tag after a check of its own passed (a transfer through
+// it), and the monitoring has no result for it since then: that check stands for the ping. The last
+// resort is tested by the monitoring only once selected (it is not tested at all before the user
+// agrees), so after the agreement the app showed "connection failed" until its first ping came,
+// though the proxy carried data; a result that came after the choice decides again, a timeout too.
+func tierChoiceStands(state tiered.State, tag string, history *adapter.URLTestHistory) bool {
+	if tag == "" || state.Node != tag || state.Since == 0 {
+		return false
+	}
+	switch state.Reason {
+	case tiered.ReasonOK, tiered.ReasonNodeFailed, tiered.ReasonTCP, tiered.ReasonSlow:
+	default:
+		return false
+	}
+	if history == nil || history.IsFromCache {
+		return true
+	}
+	return history.Time.Unix() < state.Since
 }
