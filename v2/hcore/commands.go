@@ -342,7 +342,8 @@ func (h *HiddifyInstance) UrlTest(in *UrlTestRequest) (*hcommon.Response, error)
 	}
 	monitor := monitoring.Get(h.Context())
 	// a group's test leaves out the last resorts that wait for the user's agreement (a test is a
-	// handshake with the server); a tap on one of them alone still tests it
+	// handshake with the server); a tap on one of them alone is refused by the monitoring, which
+	// holds them back from every test (see syncTierHold)
 	if out, ok := box.Outbound().Outbound(in.Tag); ok {
 		if group, isGroup := out.(adapter.OutboundGroup); isGroup {
 			if members := group.All(); len(withoutUntestable(members, groupNow(group))) < len(members) {

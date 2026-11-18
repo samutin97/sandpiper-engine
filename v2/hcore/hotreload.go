@@ -116,8 +116,13 @@ func reloadRunning(ctx context.Context, in *StartRequest) (MessageType, error) {
 	// the tiered group's choice is carried over: one the new config would have to ask the user for
 	// waits first (see tierBeforeReload)
 	restoreTiered := tierBeforeReload(pendingTierPlan.Load())
+	// the new config's last resorts are held back before it runs, beside the running one's
+	tierReloading.Store(pendingTierPlan.Load())
+	syncTierHold()
 	result, err := static.StartedService.HotReload(serviceContext(ctx), options)
 	if err != nil {
+		tierReloading.Store(nil)
+		syncTierHold()
 		restoreTiered()
 		return MessageType_HOT_RELOAD_FAILED, err
 	}

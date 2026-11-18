@@ -197,6 +197,8 @@ func (g *tierStartGuard) Start(stage adapter.StartStage, _ *adapter.Scope) error
 	}
 	setup := pendingTierPlan.Load()
 	runningTierPlan.Store(setup)
+	// before the monitoring's first test: the last resorts waiting for the agreement get none
+	holdTierReserves(instance.Context(), setup)
 	if out, ok := instance.Box().Outbound().Outbound(config.OutboundTieredTag); ok {
 		if sel, ok := out.(*group.Selector); ok {
 			tierSettle(sel, groupNow(sel), setup)
@@ -243,6 +245,8 @@ func tierReloadHolds(now string, running, next *tierSetup) bool {
 // tierAfterReload: the reloaded config runs; its group is settled as at a start.
 func tierAfterReload(next *tierSetup) {
 	runningTierPlan.Store(next)
+	tierReloading.Store(nil)
+	syncTierHold()
 	if sel := (&tierEnv{}).tieredGroup(); sel != nil {
 		tierSettle(sel, groupNow(sel), next)
 	}
@@ -362,11 +366,13 @@ func rememberTierConsent(key string) {
 		return
 	}
 	tierConsents.Lock()
-	defer tierConsents.Unlock()
 	if tierConsents.keys == nil {
 		tierConsents.keys = map[string]bool{}
 	}
 	tierConsents.keys[key] = true
+	tierConsents.Unlock()
+	// the agreed last resort may be tested from now on
+	syncTierHold()
 }
 
 func tierConsented(key string) bool {
@@ -379,7 +385,6 @@ func tierConsented(key string) bool {
 // core runs now.
 func keepTierConsents(setup *tierSetup) {
 	tierConsents.Lock()
-	defer tierConsents.Unlock()
 	kept := map[string]bool{}
 	if setup != nil {
 		for _, key := range setup.consentKeys {
@@ -389,6 +394,58 @@ func keepTierConsents(setup *tierSetup) {
 		}
 	}
 	tierConsents.keys = kept
+	tierConsents.Unlock()
+	// an agreement that ended holds its last resort back again
+	syncTierHold()
+}
+
+// The rule of the last resort holds in the monitoring too: the last resorts that wait for the
+// user's agreement are held back from every test there (OutboundMonitoring.SetUntestable, checked
+// where every test is queued: a cycle, a selection, keep top, a group's test, an AmneziaWG
+// endpoint's test of itself when it comes up, a tap in the app). They are held from the start of a
+// config (tierStartGuard, before the monitoring's first test), those of both configs during a hot
+// reload, and again whenever an agreement is given or ends. The app's tests of a group leave them
+// out besides (withoutUntestable).
+
+// tierReloading is the plan of the config a hot reload is applying, until it runs or fails.
+var tierReloading atomic.Pointer[tierSetup]
+
+// tierHeld are the last resorts of setups that wait for the user's agreement, sorted.
+func tierHeld(setups ...*tierSetup) []string {
+	held := map[string]bool{}
+	for _, setup := range setups {
+		if setup == nil {
+			continue
+		}
+		for tag := range setup.consentKeys {
+			if setup.needsConsent(tag) {
+				held[tag] = true
+			}
+		}
+	}
+	return sortedKeys(held)
+}
+
+// tierHoldBack holds tags back from every test of the monitoring of ctx's box (a test replaces it).
+var tierHoldBack = func(ctx context.Context, tags []string) {
+	if ctx == nil {
+		return
+	}
+	if monitor := monitoring.Get(ctx); monitor != nil {
+		monitor.SetUntestable(tags)
+	}
+}
+
+// holdTierReserves holds the last resorts of setups that wait for the agreement back from the tests
+// of the monitoring of ctx's box, and lets every other proxy be tested.
+func holdTierReserves(ctx context.Context, setups ...*tierSetup) {
+	tierHoldBack(ctx, tierHeld(setups...))
+}
+
+// syncTierHold holds back the last resorts of the config that runs, and of the one a hot reload is
+// applying, that wait for the agreement.
+func syncTierHold() {
+	holdTierReserves(static.Context(), runningTierPlan.Load(), tierReloading.Load())
 }
 
 // tierUntestable are the proxies nothing may test now: the last resorts still waiting for the user's
