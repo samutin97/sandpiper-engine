@@ -171,7 +171,7 @@ func tierSettle(sel tierChoice, now string, setup *tierSetup) {
 	}
 	if target != now {
 		sel.SelectOutbound(target)
-		Log(LogLevel_INFO, LogType_CORE, "tiers: the group starts on ", target, ", not on ", now)
+		tierLog("the group starts on ", target, ", not on ", now)
 	}
 }
 
@@ -206,7 +206,7 @@ func (g *tierStartGuard) Start(stage adapter.StartStage, _ *adapter.Scope) error
 	if cache := instance.CacheFile(); cache != nil {
 		if now := cache.LoadSelected(config.OutboundTieredTag); now != "" && now != config.OutboundTieredWaitTag {
 			if err := cache.StoreSelected(config.OutboundTieredTag, config.OutboundTieredWaitTag); err != nil {
-				Log(LogLevel_WARNING, LogType_CORE, "tiers: cache: ", err.Error())
+				tierLog("cache: ", err.Error())
 			}
 		}
 	}
@@ -471,7 +471,7 @@ func adoptTieredGroup() {
 	if out, ok := box.Outbound().Outbound(config.OutboundSelectTag); ok {
 		if sel, ok := out.(*group.Selector); ok && groupNow(sel) == config.OutboundURLTestTag {
 			sel.SelectOutbound(config.OutboundTieredTag)
-			Log(LogLevel_INFO, LogType_CORE, "tiers: select moves to the server's ranking (first policy)")
+			tierLog("select moves to the server's ranking (first policy)")
 		}
 	}
 }
@@ -559,13 +559,18 @@ func tierSleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// Log writes a line of the controller. Every line of the choice by the server's ranking ("tiers: ...",
+// here and in tierLog) is a warning: it is what the app keeps in app.log (warnings and above), and
+// a line that told the reason of a choice but not the choice, or the other way round, made the
+// file useless for it (lines are few: a check every ten minutes, a walk on a failure).
 func (e *tierEnv) Log(message string) {
-	level := LogLevel_INFO
-	if strings.HasPrefix(message, "tiers: using") || strings.Contains(message, "TCP to the server") || strings.Contains(message, "last resort") ||
-		strings.Contains(message, "no proxy") || strings.Contains(message, "get nothing back") {
-		level = LogLevel_WARNING
-	}
-	Log(level, LogType_CORE, message)
+	Log(LogLevel_WARNING, LogType_CORE, message)
+}
+
+// tierLog writes a line of the choice by the server's ranking from outside the controller, at the
+// level of the controller's own (tierEnv.Log).
+func tierLog(message ...any) {
+	Log(LogLevel_WARNING, LogType_CORE, append([]any{"tiers: "}, message...)...)
 }
 
 func (e *tierEnv) tieredGroup() *group.Selector {
