@@ -566,21 +566,29 @@ func setExperimental(options *option.Options, hopt *HiddifyOptions) {
 				DisableIPInfo:         !hopt.IpInfo,
 			},
 			HandshakeGate: handshakeGate(hopt),
+			SystemProxy:   systemProxyOptions(),
 		}
 	}
 	setProcs(options)
 }
 
 // The pacing of the TLS handshakes to one server (the address, whatever the server name), in one
-// place. A DPI rule described for Russian networks freezes a server for a client for minutes after
+// place. A described DPI rule freezes a server for a client for minutes after
 // more than three TLS handshakes to it within a minute with less than about 350-400 ms between
 // them (research O1). So:
 //   - one handshake at a time: a connection waits for the previous handshake to end;
 //   - a gap drawn anew between 0.7 and 1.1 s before each handshake: a margin of about twice the
 //     threshold, which a network that squeezes two packets together does not eat, and no fixed
 //     rhythm to match;
-//   - at most 4 handshakes starting in any 5 s: the start of the tunnel, a test of every proxy or
-//     a reconnection after a network change opens its connections in a row, never in a burst.
+//   - at most 4 handshakes in any 5 s: the start of the tunnel, a test of every proxy or a
+//     reconnection after a network change opens its connections in a row, never in a burst. The
+//     gate's window counts the starts of the turns, and a ClientHello follows its start after the
+//     connect, which takes longer for one connection than for another (five ClientHellos fell
+//     within 4.992 s with a window of 5 s, E9-01): the window is 5.5 s, a margin of 0.5 s for that
+//     spread, so the ClientHellos keep to 4 in 5 s as well;
+//   - a handshake the gate does not see the end of (the naive outbound's, made by cronet) holds
+//     the turn 1 s after its connect: about the handshake's length, short of the 8 s of an unused
+//     dial.
 //
 // Ordinary work is not slowed: the transports of the subscription (gRPC, XHTTP) keep one or two
 // long-lived multiplexed connections, which handshake once. What waits is a series: the second
@@ -591,9 +599,20 @@ const (
 	handshakeGateMaxInflight = 1
 	handshakeGateMinGap      = 700 * time.Millisecond
 	handshakeGateMaxGap      = 1100 * time.Millisecond
-	handshakeGateWindow      = 5 * time.Second
+	handshakeGateWindow      = 5500 * time.Millisecond
 	handshakeGateWindowMax   = 4
+	handshakeGateUnseenHold  = time.Second
 )
+
+// systemProxyRestoreCheckTimeout is how long, on Windows, the proxy that was the system proxy before
+// ours has to answer a TCP connect for its settings to be put back when ours is turned off: a
+// proxy client on the loopback answers in milliseconds, and turning the proxy off waits no longer
+// than this when it is gone.
+const systemProxyRestoreCheckTimeout = time.Second
+
+func systemProxyOptions() *option.SystemProxyOptions {
+	return &option.SystemProxyOptions{RestoreCheckTimeout: badoption.Duration(systemProxyRestoreCheckTimeout)}
+}
 
 // handshakeGate paces the TLS handshakes to one server (see above), unless the user turned it off
 // (handshake-gate false). handshake-gate-max and handshake-gate-gap-ms, when set, replace the
@@ -618,6 +637,7 @@ func handshakeGate(hopt *HiddifyOptions) *option.HandshakeGateOptions {
 		MaxGap:      badoption.Duration(maxGap),
 		Window:      badoption.Duration(handshakeGateWindow),
 		WindowMax:   handshakeGateWindowMax,
+		UnseenHold:  badoption.Duration(handshakeGateUnseenHold),
 	}
 }
 
