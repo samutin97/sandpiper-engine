@@ -298,3 +298,25 @@ func TestEveryGroupMemberIsMonitored(t *testing.T) {
 		}
 	}
 }
+
+// The check of the path dials the subscription's host by the address of a TLS proxy on it (server
+// name = the host, address = an IP), the first in the plan's order; not a REALITY proxy (its server
+// name is another site's), and the name itself without such a proxy.
+func TestTierProbeAddress(t *testing.T) {
+	options := buildPanelProfile(t, panelSubscription, tierSettings(t, panelPolicy))
+	plan := TierPlan(options, chainTestOptions(t, tierSettings(t, panelPolicy)))
+	if plan == nil {
+		t.Fatal("no plan")
+	}
+	for host, want := range map[string]string{
+		"vpn.example.net": "192.0.2.10", // 2 gRPC B, the first candidate
+		"VPN.Example.net": "192.0.2.10",
+		"www.example.org": "", // only the REALITY proxies name it
+		"sub.example.net": "", // no proxy names it
+		"":                "",
+	} {
+		if got := TierProbeAddress(options, plan, host); got != want {
+			t.Errorf("%q: %q, want %q", host, got, want)
+		}
+	}
+}

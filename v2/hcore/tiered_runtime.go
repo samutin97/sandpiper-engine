@@ -60,6 +60,9 @@ type tierSetup struct {
 	host    string
 	path    string
 	testURL string
+	// probeAddress is the IP address the check of the path dials for host, "" to dial the name
+	// (config.TierProbeAddress)
+	probeAddress string
 	// consentKeys name the user's agreement to each last resort that asks for one (and only those):
 	// the profile, its policy and the proxy itself (its options). An agreement holds for that proxy
 	// of that profile, in this run of the core: another profile with a proxy of the same tag, a new
@@ -85,6 +88,7 @@ func noteTierPlan(hopt *config.HiddifyOptions, opts *option.Options, profilePath
 		if config.ValidProbePath(tp.ProbePath) {
 			setup.path = tp.ProbePath
 		}
+		setup.probeAddress = config.TierProbeAddress(opts, plan, setup.host)
 	}
 	setup.consentKeys = tierConsentKeys(plan, profilePath, hopt.TierPolicy.Policy, profileFingerprints(profilePath))
 	pendingTierPlan.Store(setup)
@@ -911,8 +915,18 @@ func (e *tierEnv) CheckPath(ctx context.Context) tiered.PathVerdict {
 	if e.setup.host == "" || e.setup.path == "" {
 		return tiered.PathUnknown
 	}
-	response := DpiProbe(ctx, &DpiProbeRequest{Host: e.setup.host, Path: e.setup.path, Attempts: 1, TimeoutMs: 5000})
-	return pathVerdictOf(response.GetOutcome())
+	return pathVerdictOf(DpiProbe(ctx, e.setup.pathRequest()).GetOutcome())
+}
+
+// pathRequest is the check of the path: the subscription's host by the address of a proxy on it when
+// the profile has one (its turn in the handshake gate counted by that address, no DNS query for the
+// host), the host as the server name and Host header in any case.
+func (s *tierSetup) pathRequest() *DpiProbeRequest {
+	host := s.host
+	if s.probeAddress != "" {
+		host = s.probeAddress
+	}
+	return &DpiProbeRequest{Host: host, ServerName: s.host, Path: s.path, Attempts: 1, TimeoutMs: 5000}
 }
 
 // pathVerdictOf is what a probe's outcome says of the path: only a failure on the path itself

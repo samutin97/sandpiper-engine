@@ -103,3 +103,26 @@ func TestDpiProbeOutOfTimeInTheGateIsNoVerdict(t *testing.T) {
 		}
 	}
 }
+
+// With a proxy of the profile on the subscription's host, the check of the path dials its address,
+// with the host as the server name; without one, the name. The probe sends the name in the TLS
+// handshake and in the Host header whatever address it dials (and checks the certificate by it).
+func TestDpiProbeDialsTheProxyAddressWithTheName(t *testing.T) {
+	byAddress := (&tierSetup{host: "sub.example.net", path: "/files/sample.bin", probeAddress: "192.0.2.10"}).pathRequest()
+	if byAddress.Host != "192.0.2.10" || byAddress.ServerName != "sub.example.net" || byAddress.Insecure || byAddress.Path != "/files/sample.bin" {
+		t.Fatalf("%+v", byAddress)
+	}
+	byName := (&tierSetup{host: "sub.example.net", path: "/files/sample.bin"}).pathRequest()
+	if byName.Host != "sub.example.net" || byName.ServerName != "sub.example.net" {
+		t.Fatalf("%+v", byName)
+	}
+	var sni, hostHeader string
+	host, port := probeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		sni, hostHeader = r.TLS.ServerName, r.Host
+		w.Write(make([]byte, 128<<10))
+	})
+	r := DpiProbe(context.Background(), &DpiProbeRequest{Host: host, Port: port, ServerName: "example.com", Insecure: true, TimeoutMs: 3000})
+	if r.Outcome != "ok" || sni != "example.com" || hostHeader != "example.com" {
+		t.Fatalf("%s: SNI %q, Host %q", r.Outcome, sni, hostHeader)
+	}
+}

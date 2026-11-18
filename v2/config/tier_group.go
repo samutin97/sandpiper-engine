@@ -2,6 +2,7 @@ package config
 
 import (
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 
@@ -217,4 +218,44 @@ func withoutTags(tags, drop []string) []string {
 		}
 	}
 	return kept
+}
+
+// TierProbeAddress is the address the check of the path (DpiProbe) dials for the subscription's
+// host: the IP address of the first candidate of plan, in its order, that is a TLS proxy on an IP
+// address with host as its server name (REALITY is not: its server name is another site's), ""
+// without one. The check then dials that address with host as its server name and Host header: its
+// turn in the handshake gate is counted with the proxies' turns to that address, and no DNS query
+// for host goes out before it. Without such a proxy it dials the name, as before.
+func TierProbeAddress(options *option.Options, plan *tiered.Plan, host string) string {
+	if options == nil || plan == nil || host == "" {
+		return ""
+	}
+	outbounds := map[string]option.Outbound{}
+	for _, out := range options.Outbounds {
+		outbounds[out.Tag] = out
+	}
+	for _, cand := range plan.Candidates {
+		out, ok := outbounds[cand.Tag]
+		if !ok {
+			continue
+		}
+		server, ok := out.Options.(option.ServerOptionsWrapper)
+		if !ok {
+			continue
+		}
+		addr, err := netip.ParseAddr(server.TakeServerOptions().Server)
+		if err != nil {
+			continue
+		}
+		wrapper, ok := out.Options.(option.OutboundTLSOptionsWrapper)
+		if !ok {
+			continue
+		}
+		tls := wrapper.TakeOutboundTLSOptions()
+		if tls == nil || !tls.Enabled || (tls.Reality != nil && tls.Reality.Enabled) || !strings.EqualFold(tls.ServerName, host) {
+			continue
+		}
+		return addr.Unmap().String()
+	}
+	return ""
 }
