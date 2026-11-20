@@ -15,7 +15,9 @@ var (
 	}{
 		{regexp.MustCompile(`(?i)\b(?:vless|vmess|trojan|ss|ssr|socks5?|hysteria2?|hy2|tuic|wireguard|wg|awg|warp|mieru|naive\+https|naive|anytls|shadowtls|sdns|ssh|sudoku|vpn)://[^\s"'<>]+`), "<link>"},
 		{regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`), "<uuid>"},
-		{regexp.MustCompile(`(?i)\b(password|passwd|token|auth[_-]?token|secret|private[_-]?key|preshared[_-]?key|header[_-]?protection[_-]?key|psk|public[_-]?key|short[_-]?id|uuid|lan-sharing-password|local-proxy-password)(["']?\s*[:=]\s*["']?)[^\s"',;&}]+`), "$1$2<redacted>"},
+		{regexp.MustCompile(`(?i)\b(password|passwd|token|auth[_-]?token|secret|private[_-]?key|preshared[_-]?key|header[_-]?protection[_-]?key|psk|public[_-]?key|short[_-]?id|uuid|lan-sharing-password|local-proxy-password|alt[_-]url)(["']?\s*[:=]\s*["']?)[^\s"',;&}]+`), "$1$2<redacted>"},
+		// the other subscription of a profile's pair: its link in base64url, which starts the same for any https link
+		{regexp.MustCompile(`\baHR0cHM6Ly[A-Za-z0-9_+/-]*=*`), "<link>"},
 		// a WireGuard key (32 bytes in base64) or a 32-byte hex key on its own
 		{regexp.MustCompile(`\b[A-Za-z0-9+/]{43}=`), "<key>"},
 		{regexp.MustCompile(`(?i)\b[0-9a-f]{64}\b`), "<key>"},

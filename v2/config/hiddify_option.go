@@ -100,6 +100,10 @@ type HiddifyOptions struct {
 	// checks of the proxies, the tiered group's choices, the network, the connections through the
 	// proxies and the handshakes to each server, never what the user visits), on unless false.
 	BlockJournal *bool `json:"block-journal,omitempty"`
+	// ExitChoice is the way out to the internet the profile is on, "main" or "warp" (the app's
+	// pair of subscriptions, profile-exits): written to the journal's start line, so an analysis of a
+	// block knows which one it reads. Anything else is left out. Never the other subscription's link.
+	ExitChoice string `json:"exit-choice,omitempty"`
 
 	DNSOptions
 	InboundOptions

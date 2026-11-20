@@ -23,3 +23,25 @@ func TestScrubLogLine(t *testing.T) {
 		t.Fatalf("debug: %q", got)
 	}
 }
+
+// The other subscription of a profile's pair is a secret like the profile's own link: under its key
+// or alone, in base64url, it never stays in a line.
+func TestScrubLogLinePairLink(t *testing.T) {
+	old := static.logLevel.Load()
+	defer static.logLevel.Store(old)
+	const link = "aHR0cHM6Ly9leGFtcGxlLm9yZy9zdWIvd2FycC10b2tlbg"
+	for _, level := range []LogLevel{LogLevel_WARNING, LogLevel_DEBUG} {
+		static.logLevel.Store(int32(level))
+		for _, line := range []string{
+			"profile-exits: v=1;cur=main;alt=warp;alt-url=" + link,
+			`{"alt-url": "` + link + `"}`,
+			"alt_url=" + link,
+			"the other one is " + link + " now",
+		} {
+			got := scrubLogLine(line)
+			if strings.Contains(got, link) || strings.Contains(got, "aHR0cHM6") {
+				t.Fatalf("level %v: the link is left in %q", level, got)
+			}
+		}
+	}
+}

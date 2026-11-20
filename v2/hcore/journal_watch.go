@@ -97,6 +97,19 @@ func stopJournalWatch() {
 	journalWatch.cancel, journalWatch.done = nil, nil
 }
 
+// journalExit is the way out to the internet the profile is on, "main" or "warp", as the app
+// sent it: nothing for anything else (a profile without a pair, a value this core does not know).
+func journalExit(options *config.HiddifyOptions) string {
+	if options == nil {
+		return ""
+	}
+	switch options.ExitChoice {
+	case "main", "warp":
+		return options.ExitChoice
+	}
+	return ""
+}
+
 // journalStart writes the start of a config: the core, the tiered group, each proxy.
 func journalStart(proxies map[string]config.JournalProxy, setup *tierSetup) {
 	candidates := map[string]tiered.Candidate{}
@@ -106,7 +119,11 @@ func journalStart(proxies map[string]config.JournalProxy, setup *tierSetup) {
 		}
 	}
 	gate := static.HiddifyOptions == nil || static.HiddifyOptions.HandshakeGate == nil || *static.HiddifyOptions.HandshakeGate
-	journalWrite("start", "core", constants.Version, "proxies", len(proxies), "tiered", setup != nil, "gate", gate)
+	head := []any{"core", constants.Version, "proxies", len(proxies), "tiered", setup != nil, "gate", gate}
+	if exit := journalExit(static.HiddifyOptions); exit != "" {
+		head = append(head, "exit", exit)
+	}
+	journalWrite("start", head...)
 	for _, tag := range sortedKeys(proxies) {
 		p := proxies[tag]
 		fields := []any{"tag", tag, "srv", p.Server, "proto", p.Protocol, "tr", p.Transport, "sni", p.ServerName}

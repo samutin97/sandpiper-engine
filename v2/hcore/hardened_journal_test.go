@@ -541,3 +541,33 @@ func TestErrClass(t *testing.T) {
 		require.Equal(t, want, errClass(err), "%v", err)
 	}
 }
+
+// The start line says which way out to the internet the profile is on (the app's pair of
+// subscriptions), and only main or warp: nothing for a profile without a pair or any other text.
+func TestJournalStartSaysTheWayOut(t *testing.T) {
+	dir := journalTestDir(t)
+	saved := static.HiddifyOptions
+	t.Cleanup(func() { static.HiddifyOptions = saved })
+	for _, c := range []struct{ choice, want string }{
+		{"main", "main"},
+		{"warp", "warp"},
+		{"", ""},
+		{"https://example.org/sub/token", ""},
+		{"psiphon", ""},
+	} {
+		static.HiddifyOptions = &config.HiddifyOptions{ExitChoice: c.choice}
+		journalStart(nil, nil)
+	}
+	static.HiddifyOptions = nil
+	journalStart(nil, nil)
+	_, events := journalEvents(t, dir)
+	require.Len(t, events, 6)
+	for i, want := range []string{"main", "warp", "", "", "", ""} {
+		require.Equal(t, "start", events[i]["ev"], "%v", events[i])
+		if want == "" {
+			require.NotContains(t, events[i], "exit", "line %d", i)
+		} else {
+			require.Equal(t, want, events[i]["exit"], "line %d", i)
+		}
+	}
+}
