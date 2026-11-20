@@ -571,3 +571,27 @@ func TestJournalStartSaysTheWayOut(t *testing.T) {
 		}
 	}
 }
+
+// The whole way on the core's side: the settings JSON the app sends (exit-choice) is read into the
+// options, and the journal's start line carries it.
+func TestJournalStartExitFromTheSettingsJSON(t *testing.T) {
+	dir := journalTestDir(t)
+	saved := static.HiddifyOptions
+	t.Cleanup(func() { static.HiddifyOptions = saved })
+	for _, settings := range []string{
+		`{"exit-choice": "main"}`,
+		`{"exit-choice": "warp", "block-journal": true}`,
+		`{"exit-choice": null}`,
+		`{}`,
+	} {
+		_, err := ChangeHiddifySettings(&ChangeHiddifySettingsRequest{HiddifySettingsJson: settings}, false)
+		require.NoError(t, err)
+		journalStart(nil, nil)
+	}
+	_, events := journalEvents(t, dir)
+	require.Len(t, events, 4)
+	require.Equal(t, "main", events[0]["exit"])
+	require.Equal(t, "warp", events[1]["exit"])
+	require.NotContains(t, events[2], "exit")
+	require.NotContains(t, events[3], "exit")
+}
